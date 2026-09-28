@@ -10,7 +10,7 @@ static const TCHAR* CampPreviewMeshPath = TEXT("/Game/ARACHNE/Characters/SK_Arac
 AArachneCampPoint::AArachneCampPoint()
 {
     WaitTimeMin = WaitTimeMax = 0.f;
-    AcceptRadius = 170.f;
+    AcceptRadius = 260.f;   // the anchor glide covers the last stretch from any surface
     PreviewPawnClass = AArachnePawn::StaticClass();
 
     Preview = CreateDefaultSubobject<UPoseableMeshComponent>(TEXT("PosePreview"));

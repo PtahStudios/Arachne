@@ -94,6 +94,8 @@ public:
     /** Surfaces steeper than this (relative to the current one) are entered with an arc instead of normal smoothing. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float TransitionMinAngle = 38.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float EdgeWrapReach = 90.f;
+    /** After rolling onto a new surface, rolling straight back onto the one just left is blocked this long (s). Stops corner ping-pong. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float ReturnTransitionDelay = .8f;
 
     // ---------------------------------------------------------------- falling (only when knocked off a surface)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Falling") float GravityScale = 1.4f;
@@ -108,6 +110,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float FootProbeReach = 110.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") int32 MaxSwingingLegs = 4;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float IdleSettleDistance = 7.f;
+    /** Body collision radius while squeezing through a doorway (normal radius comes from the BodyCollision component). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float PassageCollisionRadius = 30.f;
+    /** Feet keep this far inside the jambs while crossing a doorway (cm). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float PassageFootMargin = 12.f;
     /** While anchored, a foot further than this from its anchor contact steps again. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float AnchorFootTolerance = 6.f;
 
@@ -154,6 +160,15 @@ public:
     /** True once the body reached the anchor and every foot that has a contact is planted on it. */
     UFUNCTION(BlueprintPure, Category="Arachne|Anchor") bool IsAnchorSettled() const;
 
+    // ---------------------------------------------------------------- doorways
+    /**
+     * Squeeze through an opening: no climbing onto the jambs (the body slides along them instead), a smaller body
+     * collision, feet only on the floor and pulled in to the opening's width near the door plane.
+     */
+    UFUNCTION(BlueprintCallable, Category="Arachne|Doorway") void BeginPassage(FVector Center, FVector Direction, float HalfWidth);
+    UFUNCTION(BlueprintCallable, Category="Arachne|Doorway") void EndPassage();
+    UFUNCTION(BlueprintPure, Category="Arachne|Doorway") bool IsInPassage() const { return bPassage; }
+
     // ---------------------------------------------------------------- misc
     UFUNCTION(BlueprintCallable, Category="Arachne") void ResetCrawler(FVector Location, FRotator Rotation);
     /** Physics kick. Strong kicks away from the surface detach the spider. */
@@ -180,6 +195,8 @@ private:
     bool IsStepUp(const FHitResult& Wall) const;
     bool FindConvexEdge(const FVector& Direction, FHitResult& Face, FVector& Edge) const;
     void BeginTransition(const FVector& Pivot, const FVector& NewUp, const FVector& Forward, bool bConvex, UPrimitiveComponent* NewSupport);
+    /** True when NewUp is the surface we just rolled off (too soon to go back). */
+    bool IsReturnBlocked(const FVector& NewUp) const;
     void Land(const FHitResult& Hit);
     void Detach();
     void RotateFrame(const FQuat& Delta, bool bRotateVelocity);
@@ -192,6 +209,8 @@ private:
     void LoadSpiderAsset();
     FTransform BaseMeshTransform() const;
     bool FindFoot(const FArachneLeg& Leg, const FVector& Home, FHitResult& Hit) const;
+    /** In a doorway: pulls a foot target sideways inside the jambs (only near the door plane). */
+    FVector ClampToPassage(const FVector& Home) const;
     void ComputeAnchorFeet();
     void UpdateLegs(float Dt);
     void UpdateGroundedLegs(float Dt);
@@ -230,8 +249,17 @@ private:
     float YawRate = 0.f;
     float GaitPhase = 0.f;
     FArachneTransition Transition;
+    FVector LeftSurfaceUp = FVector::ZeroVector;   // surface left by the last completed transition
+    float SinceTransition = 100.f;
     TWeakObjectPtr<UPrimitiveComponent> BodySupport;
     FTransform LastSupportTransform = FTransform::Identity;
+
+    // doorway passage
+    bool bPassage = false;
+    FVector PassageCenter = FVector::ZeroVector;
+    FVector PassageDir = FVector::ForwardVector;
+    float PassageHalfWidth = 50.f;
+    float DefaultCollisionRadius = 46.f;
 
     // anchor
     FArachneAnchor Anchor;

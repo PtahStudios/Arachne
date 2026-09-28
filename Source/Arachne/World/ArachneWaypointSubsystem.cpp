@@ -1,6 +1,7 @@
 #include "World/ArachneWaypointSubsystem.h"
 #include "World/ArachneWaypoint.h"
 #include "World/ArachneCampPoint.h"
+#include "World/ArachneDoorway.h"
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 
@@ -28,12 +29,37 @@ bool UArachneWaypointSubsystem::HasClearPath(const UWorld* World, const FVector&
     return !World->SweepSingleByObjectType(Hit, From, To, FQuat::Identity, Objects, FCollisionShape::MakeSphere(Radius), Params);
 }
 
+bool UArachneWaypointSubsystem::HasWalkableLine(const UWorld* World, const FVector& From, const FVector& To, float Radius)
+{
+    if (!World) return false;
+    // Not steeper than stairs (rise / run <= 0.9), small height changes always allowed.
+    const double Rise = FMath::Abs(To.Z - From.Z), Run = FVector::Dist2D(From, To);
+    if (Rise > FMath::Max(60.0, Run * .9)) return false;
+    if (!HasClearPath(World, From, To, Radius)) return false;
+
+    // Ground must stay within reach below the whole line (waypoints sit ~75 cm above the floor).
+    FCollisionObjectQueryParams Objects;
+    Objects.AddObjectTypesToQuery(ECC_WorldStatic);
+    Objects.AddObjectTypesToQuery(ECC_WorldDynamic);
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(ArachneWalkableLine), false);
+    const int32 Samples = FMath::Max(1, FMath::CeilToInt(FVector::Dist(From, To) / 60.0));
+    for (int32 I = 1; I < Samples; ++I)
+    {
+        const FVector P = FMath::Lerp(From, To, static_cast<double>(I) / Samples);
+        FHitResult Hit;
+        if (!World->LineTraceSingleByObjectType(Hit, P, P - FVector(0, 0, 160.0), Objects, Params)) return false;
+    }
+    return true;
+}
+
 bool UArachneWaypointSubsystem::CanAutoLink(const AArachneWaypoint* A, const AArachneWaypoint* B)
 {
     if (!A || !B || A == B || !A->bAutoLink || !B->bAutoLink) return false;
     const FVector PA = A->GetArrivalLocation(), PB = B->GetArrivalLocation();
     if (FVector::Dist(PA, PB) > FMath::Min(A->AutoLinkDistance, B->AutoLinkDistance)) return false;
-    return HasClearPath(A->GetWorld(), PA, PB);
+    // Camp points hang in corners, away from the floor: they only need a clear line from a floor waypoint.
+    if (A->IsCampPoint() || B->IsCampPoint()) return !(A->IsCampPoint() && B->IsCampPoint()) && HasClearPath(A->GetWorld(), PA, PB, 25.f);
+    return HasWalkableLine(A->GetWorld(), PA, PB);
 }
 
 int32 UArachneWaypointSubsystem::IndexOf(const AArachneWaypoint* Waypoint) const
@@ -65,18 +91,23 @@ void UArachneWaypointSubsystem::RebuildIfDirty() const
 
 AArachneWaypoint* UArachneWaypointSubsystem::FindNearestReachable(const FVector& Location, bool bAllowCampPoints) const
 {
-    // Nearest first; the first one with a clear path wins.
+    // Nearest first (height counts triple: other storeys are far away in practice).
     TArray<TPair<double, AArachneWaypoint*>> Sorted;
     for (const TWeakObjectPtr<AArachneWaypoint>& W : Waypoints)
     {
         AArachneWaypoint* Waypoint = W.Get();
         if (!Waypoint || (!bAllowCampPoints && Waypoint->IsCampPoint())) continue;
-        Sorted.Add({FVector::DistSquared(Location, Waypoint->GetArrivalLocation()), Waypoint});
+        FVector D = Waypoint->GetArrivalLocation() - Location;
+        D.Z *= 3.0;
+        Sorted.Add({D.SizeSquared(), Waypoint});
     }
     Sorted.Sort([](const TPair<double, AArachneWaypoint*>& A, const TPair<double, AArachneWaypoint*>& B) { return A.Key < B.Key; });
+    // Prefer a walkable line, then any clear line (she may be on a wall / ceiling), then just the closest.
+    for (const TPair<double, AArachneWaypoint*>& Entry : Sorted)
+        if (!Entry.Value->IsCampPoint() && HasWalkableLine(GetWorld(), Location, Entry.Value->GetArrivalLocation())) return Entry.Value;
     for (const TPair<double, AArachneWaypoint*>& Entry : Sorted)
         if (HasClearPath(GetWorld(), Location, Entry.Value->GetArrivalLocation())) return Entry.Value;
-    return Sorted.Num() ? Sorted[0].Value : nullptr;   // nothing visible: best guess is the closest one
+    return Sorted.Num() ? Sorted[0].Value : nullptr;
 }
 
 bool UArachneWaypointSubsystem::FindPath(const FVector& From, const AArachneWaypoint* Goal, TArray<AArachneWaypoint*>& OutPath) const
@@ -132,7 +163,7 @@ void UArachneWaypointSubsystem::GetPatrolPoints(TArray<AArachneWaypoint*>& Out) 
 {
     Out.Reset();
     for (const TWeakObjectPtr<AArachneWaypoint>& W : Waypoints)
-        if (AArachneWaypoint* Waypoint = W.Get(); Waypoint && !Waypoint->IsCampPoint()) Out.Add(Waypoint);
+        if (AArachneWaypoint* Waypoint = W.Get(); Waypoint && !Waypoint->IsCampPoint() && Waypoint->bPatrolDestination) Out.Add(Waypoint);
 }
 
 void UArachneWaypointSubsystem::GetCampPoints(TArray<AArachneCampPoint*>& Out) const
@@ -140,6 +171,13 @@ void UArachneWaypointSubsystem::GetCampPoints(TArray<AArachneCampPoint*>& Out) c
     Out.Reset();
     for (const TWeakObjectPtr<AArachneWaypoint>& W : Waypoints)
         if (AArachneCampPoint* Camp = Cast<AArachneCampPoint>(W.Get())) Out.Add(Camp);
+}
+
+void UArachneWaypointSubsystem::GetDoorways(TArray<AArachneDoorway*>& Out) const
+{
+    Out.Reset();
+    for (const TWeakObjectPtr<AArachneWaypoint>& W : Waypoints)
+        if (AArachneDoorway* Door = Cast<AArachneDoorway>(W.Get())) Out.Add(Door);
 }
 
 void UArachneWaypointSubsystem::DrawDebug() const
@@ -150,8 +188,8 @@ void UArachneWaypointSubsystem::DrawDebug() const
     {
         const AArachneWaypoint* A = Waypoints[I].Get();
         if (!A) continue;
-        const FColor Color = A->IsCampPoint() ? FColor(255, 60, 200) : FColor(255, 170, 40);
-        DrawDebugSphere(World, A->GetArrivalLocation(), 18.f, 8, Color, false, 0.f, 0, 1.f);
+        const FColor Color = A->IsCampPoint() ? FColor(255, 60, 200) : A->bPatrolDestination ? FColor(255, 170, 40) : FColor(120, 120, 120);
+        DrawDebugSphere(World, A->GetArrivalLocation(), A->bPatrolDestination || A->IsCampPoint() ? 18.f : 9.f, 8, Color, false, 0.f, 0, 1.f);
         for (const int32 J : Links[I])
             if (J > I)
                 if (const AArachneWaypoint* B = Waypoints[J].Get())

@@ -39,7 +39,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Stimulus|Visibility") float SprintVisibilityMultiplier = 1.25f;
 
     // ---------------------------------------------------------------- debug
-    /** Always draw noise and visibility ranges (F1 / Arachne.Debug draws them too). */
+    /** Always draw noise and visibility ranges (key 0 / Arachne.Debug draws them too). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Stimulus|Debug") bool bDebug = false;
 
     UPROPERTY(BlueprintAssignable, Category="Stimulus") FArachneCaughtSignature OnCaught;

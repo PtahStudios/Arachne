@@ -11,10 +11,10 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 
-/** Drops leading route points while the one after them can be reached in a straight line. */
+/** Drops leading route points while the one after them can be walked to in a straight line. */
 static void PullString(const UWorld* World, const FVector& From, TArray<FVector>& Points)
 {
-    while (Points.Num() > 1 && UArachneWaypointSubsystem::HasClearPath(World, From, Points[1])) Points.RemoveAt(0);
+    while (Points.Num() > 1 && UArachneWaypointSubsystem::HasWalkableLine(World, From, Points[1])) Points.RemoveAt(0);
 }
 
 UArachneBrainComponent::UArachneBrainComponent()
@@ -355,17 +355,12 @@ void UArachneBrainComponent::PickNextPatrolPoint()
         return RecentWaypoints.ContainsByPredicate([W](const TWeakObjectPtr<AArachneWaypoint>& R) { return R.Get() == W; });
     };
 
-    // Prefer linked neighbours that were not visited lately, then any patrol point, then anything but the current one.
+    // Patrol destinations (door / stair helpers are only walked through), not visited lately, nearer ones more likely.
     TArray<AArachneWaypoint*> Candidates;
-    if (Waypoints && Current) Waypoints->GetNeighbours(Current, Candidates);
-    Candidates.RemoveAll([&](const AArachneWaypoint* W) { return W->IsCampPoint() || W == Current || IsRecent(W); });
-    if (Candidates.Num() == 0 && Waypoints)
-    {
-        Waypoints->GetPatrolPoints(Candidates);
-        TArray<AArachneWaypoint*> Fresh = Candidates.FilterByPredicate([&](const AArachneWaypoint* W) { return W != Current && !IsRecent(W); });
-        if (Fresh.Num()) Candidates = Fresh;
-        else Candidates.RemoveAll([Current](const AArachneWaypoint* W) { return W == Current; });
-    }
+    if (Waypoints) Waypoints->GetPatrolPoints(Candidates);
+    TArray<AArachneWaypoint*> Fresh = Candidates.FilterByPredicate([&](const AArachneWaypoint* W) { return W != Current && !IsRecent(W); });
+    if (Fresh.Num()) Candidates = Fresh;
+    else Candidates.RemoveAll([Current](const AArachneWaypoint* W) { return W == Current; });
     if (Candidates.Num() == 0)
     {
         Navigator->Stop();
@@ -373,7 +368,23 @@ void UArachneBrainComponent::PickNextPatrolPoint()
         WaitTimer = 2.f;
         return;
     }
-    AArachneWaypoint* Next = Candidates[FMath::RandRange(0, Candidates.Num() - 1)];
+    const FVector Pos = Pawn->GetActorLocation();
+    float Total = 0.f;
+    TArray<float> Weights;
+    for (const AArachneWaypoint* W : Candidates)
+    {
+        FVector D = W->GetArrivalLocation() - Pos;
+        D.Z *= 3.0;   // changing storey is a long walk
+        Weights.Add(1.f / (1.f + static_cast<float>(D.Size()) / PatrolDistanceFalloff));
+        Total += Weights.Last();
+    }
+    float Roll = FMath::FRand() * Total;
+    AArachneWaypoint* Next = Candidates.Last();
+    for (int32 I = 0; I < Candidates.Num(); ++I)
+    {
+        Roll -= Weights[I];
+        if (Roll <= 0.f) { Next = Candidates[I]; break; }
+    }
     CurrentWaypoint = Next;
     RouteToWaypoint(Next, false);
 }
@@ -412,7 +423,7 @@ void UArachneBrainComponent::RouteToWaypoint(AArachneWaypoint* Waypoint, bool bS
 void UArachneBrainComponent::RouteTo(const FVector& Goal, float AcceptRadius, bool bSprint)
 {
     const FVector Pos = Pawn->GetActorLocation();
-    if (!Waypoints || UArachneWaypointSubsystem::HasClearPath(GetWorld(), Pos, Goal))
+    if (!Waypoints || UArachneWaypointSubsystem::HasWalkableLine(GetWorld(), Pos, Goal))
     {
         Navigator->MoveTo(Goal, AcceptRadius, bSprint);
         return;

@@ -4,6 +4,16 @@
 #include "ArachneNavigatorComponent.generated.h"
 
 class AArachnePawn;
+class AArachneDoorway;
+struct FHitResult;
+
+/** Door crossing manoeuvre state. */
+enum class EArachneDoorPhase : uint8
+{
+    None,
+    Approach,   // on the floor to the entry point in front of the door, lining up
+    Cross       // straight through the middle to the exit point, body in passage mode
+};
 
 UENUM(BlueprintType)
 enum class EArachneMoveStatus : uint8
@@ -29,6 +39,8 @@ enum class EArachneSurface : uint8
  *    To change surface it steers at the chosen surface and the body's corner arcs do the climbing.
  *  - Spider gait (when not sprinting): stop-and-go bursts, speed jitter, heading wobble, occasional crab walk.
  *  - Stuck detection: no progress -> fall back to the floor / other wall, then report Stuck.
+ *  - Doorways (AArachneDoorway) on the route - given or crossed by any segment - become a crossing manoeuvre:
+ *    approach on the floor, line up, walk straight through the middle in passage mode, exit, carry on.
  */
 UCLASS(ClassGroup=(Arachne), meta=(BlueprintSpawnableComponent))
 class ARACHNE_API UArachneNavigatorComponent : public UActorComponent
@@ -54,6 +66,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Navigator|Surfaces") float SurfaceScanDistance = 700.f;
     /** Height above the floor kept while travelling along a wall (cm). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Navigator|Surfaces") float WallCruiseHeight = 165.f;
+    /** Doorways, stairs and low ceilings within this distance ahead on the route (cm) keep her on the floor, walking straight. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Navigator|Surfaces") float TightLookahead = 500.f;
     /** Within this (horizontal) distance of the last point, switch to the surface the target sits on. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Navigator|Surfaces") float GoalSurfaceDistance = 300.f;
 
@@ -93,21 +107,37 @@ public:
     const TArray<FVector>& GetRoute() const { return Route; }
 
 private:
+    void BuildRoute(const TArray<FVector>& Points);
+    void AdvanceRoute();
+    /** Drives the crossing of the doorway at the current route point. */
+    void TickDoor(AArachneDoorway* Door, float Dt);
+    void EndDoor();
     void BeginSegment();
     void UpdateGait(float Dt);
     void UpdateStuck(float Dist, float Dt);
-    FVector ComputeSteer(const FVector& Target) const;
+    FVector ComputeSteer(const FVector& Target, bool bTight) const;
+    /** Doorway (low lintel / jambs on both sides), stairs (ground steps around it) or low headroom. */
+    bool IsTightPoint(const FVector& Point) const;
+    bool IsNearTightPoint() const;
     bool ScanSurface(EArachneSurface Kind, const FVector& TravelDir, float Side, FVector& OutPoint, FVector& OutNormal) const;
     bool Trace(const FVector& From, const FVector& To, FHitResult& Hit) const;
     EArachneSurface ClassifyNormal(const FVector& Normal) const;
     EArachneSurface CurrentSurface() const;
-    EArachneSurface SurfaceNear(const FVector& Location) const;
+    /** Kind of the nearest surface to Location and how many different surfaces are close (a corner = 2+). */
+    EArachneSurface SurfaceNear(const FVector& Location, int32* OutCloseSurfaces = nullptr) const;
     bool IsDebugOn() const;
     void DrawDebug() const;
 
     UPROPERTY() TObjectPtr<AArachnePawn> Pawn;
 
     TArray<FVector> Route;
+    TArray<bool> RouteTight;
+    TArray<TWeakObjectPtr<AArachneDoorway>> RouteDoors;   // parallel to Route: set where the point is a doorway
+
+    EArachneDoorPhase DoorPhase = EArachneDoorPhase::None;
+    TWeakObjectPtr<AArachneDoorway> ActiveDoor;
+    FVector DoorTravel = FVector::ForwardVector;
+    float DoorTimer = 0.f;
     int32 RouteIndex = 0;
     float FinalRadius = 100.f;
     bool bSprint = false;
@@ -115,6 +145,8 @@ private:
 
     EArachneSurface Surface = EArachneSurface::Floor;
     EArachneSurface GoalSurface = EArachneSurface::Floor;
+    bool bGoalInCorner = false;          // goal hangs in a corner (camp): approach on whatever surface she is on
+    FVector SegmentWall = FVector::ZeroVector;   // the wall this segment travels along, once reached
     float WallSide = 1.f;
 
     float GaitTimer = 0.f;

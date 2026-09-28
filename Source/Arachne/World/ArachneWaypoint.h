@@ -9,7 +9,8 @@ class UArrowComponent;
 /**
  * Patrol waypoint. Arachne walks between these (no navmesh): waypoints that see each other within AutoLinkDistance
  * are linked automatically at runtime by line-of-sight casts; ManualLinks add links the casts cannot find.
- * Place them at body height (~75 cm) above floors, in doorways and at corridor ends.
+ * Place them at body height (~75 cm) above floors: room centres (destinations), both sides of doors and along stairs
+ * (helpers, bPatrolDestination off). Links only form along lines a body can walk: clear of geometry and over ground.
  */
 UCLASS(Blueprintable)
 class ARACHNE_API AArachneWaypoint : public AActor
@@ -23,6 +24,8 @@ public:
     /** Seconds Arachne lingers here before moving on. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Waypoint", meta=(ClampMin="0")) float WaitTimeMin = .5f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Waypoint", meta=(ClampMin="0")) float WaitTimeMax = 3.f;
+    /** Patrol walks to and lingers at this point. Turn off for helper points in doorways and on stairs: they are only passed through. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Waypoint") bool bPatrolDestination = true;
     /** How close the body has to get to count as arrived (cm). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Waypoint", meta=(ClampMin="20")) float AcceptRadius = 110.f;
     /** Link automatically to every waypoint in clear line of sight within AutoLinkDistance. */

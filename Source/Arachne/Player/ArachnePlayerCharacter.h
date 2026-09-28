@@ -33,11 +33,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Movement") float WalkSpeed = 260.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Movement") float SprintSpeed = 520.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Look") float LookSensitivity = 1.f;
+    /** Brightness, range, cone, colour: edit them on the Flashlight component itself (it is the only source of truth). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Flashlight") bool bFlashlightOnAtStart = false;
-    /** Flashlight brightness in lumens. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Flashlight") float FlashlightLumens = 900.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Flashlight") float FlashlightRange = 2500.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Flashlight") float FlashlightConeAngle = 26.f;
     /** How fast the view snaps to the spider when caught. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Player|Caught") float CaughtTurnSpeed = 14.f;
 
@@ -56,6 +53,7 @@ private:
     void OnSprintOff(const FInputActionValue& Value);
     void OnFlashlight(const FInputActionValue& Value);
     void OnDebug(const FInputActionValue& Value);
+    void OnIgnoreToggle(const FInputActionValue& Value);
     void OnReset(const FInputActionValue& Value);
     void ApplySprint(bool bSprint);
     UFUNCTION() void HandleCaught(AActor* Predator);
@@ -66,6 +64,7 @@ private:
     UPROPERTY(Transient) TObjectPtr<UInputAction> SprintAction;
     UPROPERTY(Transient) TObjectPtr<UInputAction> FlashlightAction;
     UPROPERTY(Transient) TObjectPtr<UInputAction> DebugAction;
+    UPROPERTY(Transient) TObjectPtr<UInputAction> IgnoreAction;
     UPROPERTY(Transient) TObjectPtr<UInputAction> ResetAction;
 
     bool bSprinting = false;

@@ -16,7 +16,9 @@ void AArachneHUD::DrawHUD()
 {
     Super::DrawHUD();
     AArachnePlayerCharacter* Player = Cast<AArachnePlayerCharacter>(GetOwningPawn());
-    DrawText(TEXT("WASD move  |  Mouse look  |  Shift sprint  |  F flashlight  |  F1 debug  |  R reset"), FColor(200, 200, 200), 24, 24, nullptr, 1.f);
+    DrawText(TEXT("WASD move  |  Mouse look  |  Shift sprint  |  F flashlight  |  0 debug  |  9 Arachne ignores you  |  R reset"), FColor(200, 200, 200), 24, 24, nullptr, 1.f);
+    if (ArachneDebug::IsIgnoringPlayer())
+        DrawText(TEXT("ARACHNE IGNORES THE PLAYER (9)"), FColor(120, 255, 140), 24.f, static_cast<float>(Canvas->SizeY) - 48.f, nullptr, 1.2f);
     if (!Player) return;
     if (ArachneDebug::IsEnabled()) DrawDebugReadout(Player);
     if (Player->IsCaught()) DrawCaughtScreen(Player);

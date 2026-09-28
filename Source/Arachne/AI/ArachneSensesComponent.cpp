@@ -54,7 +54,7 @@ void UArachneSensesComponent::TickComponent(float DeltaTime, ELevelTick TickType
 
 void UArachneSensesComponent::SenseSource(UArachneStimulusSourceComponent* Source, float Dt)
 {
-    if (!Source || !Source->CanBeSensed()) return;
+    if (!Source || !Source->CanBeSensed() || ArachneDebug::IsIgnoringPlayer()) return;
     AActor* Prey = Source->GetOwner();
     const FVector Body = Pawn->GetActorLocation();
 
@@ -102,7 +102,7 @@ void UArachneSensesComponent::SenseSource(UArachneStimulusSourceComponent* Sourc
 
 void UArachneSensesComponent::HandleNoise(const FArachneNoise& Noise)
 {
-    if (!Pawn || !Memory || Noise.Instigator.Get() == GetOwner()) return;
+    if (!Pawn || !Memory || Noise.Instigator.Get() == GetOwner() || ArachneDebug::IsIgnoringPlayer()) return;
     const FVector Ear = Pawn->GetActorLocation();
     double Radius = Noise.Radius * HearingScale * Sensitivity;
     FCollisionQueryParams Params(SCENE_QUERY_STAT(ArachneHearing), false, GetOwner());

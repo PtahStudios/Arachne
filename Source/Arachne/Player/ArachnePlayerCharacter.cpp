@@ -37,6 +37,10 @@ AArachnePlayerCharacter::AArachnePlayerCharacter()
     Flashlight->SetupAttachment(Camera);
     Flashlight->SetRelativeLocation(FVector(10, 12, -12));
     Flashlight->SetIntensityUnits(ELightUnits::Lumens);
+    Flashlight->SetIntensity(900.f);
+    Flashlight->SetAttenuationRadius(2500.f);
+    Flashlight->SetOuterConeAngle(26.f);
+    Flashlight->SetInnerConeAngle(14.f);
     Flashlight->SetVisibility(false);
 
     Stimulus = CreateDefaultSubobject<UArachneStimulusSourceComponent>(TEXT("Stimulus"));
@@ -50,10 +54,6 @@ void AArachnePlayerCharacter::BeginPlay()
 {
     Super::BeginPlay();
     GetCharacterMovement()->MaxWalkSpeed = WalkSpeed;
-    Flashlight->SetIntensity(FlashlightLumens);
-    Flashlight->SetAttenuationRadius(FlashlightRange);
-    Flashlight->SetOuterConeAngle(FlashlightConeAngle);
-    Flashlight->SetInnerConeAngle(FlashlightConeAngle * .55f);
     SetFlashlight(bFlashlightOnAtStart);
     Stimulus->OnCaught.AddDynamic(this, &AArachnePlayerCharacter::HandleCaught);
     if (APlayerController* PC = Cast<APlayerController>(GetController()))
@@ -136,6 +136,7 @@ void AArachnePlayerCharacter::EnsureInputAssets()
     SprintAction     = MakeAction(TEXT("IA_PlayerSprint"), EInputActionValueType::Boolean);
     FlashlightAction = MakeAction(TEXT("IA_PlayerFlashlight"), EInputActionValueType::Boolean);
     DebugAction      = MakeAction(TEXT("IA_PlayerDebug"), EInputActionValueType::Boolean);
+    IgnoreAction     = MakeAction(TEXT("IA_PlayerIgnoreToggle"), EInputActionValueType::Boolean);
     ResetAction      = MakeAction(TEXT("IA_PlayerReset"), EInputActionValueType::Boolean);
 
     InputContext = NewObject<UInputMappingContext>(this, TEXT("IMC_Player"));
@@ -168,7 +169,8 @@ void AArachnePlayerCharacter::EnsureInputAssets()
     Map(SprintAction, EKeys::Gamepad_LeftThumbstick, false, false);
     Map(FlashlightAction, EKeys::F, false, false);
     Map(FlashlightAction, EKeys::Gamepad_FaceButton_Top, false, false);
-    Map(DebugAction, EKeys::F1, false, false);
+    Map(DebugAction, EKeys::Zero, false, false);   // F1 stays free for the editor wireframe view mode
+    Map(IgnoreAction, EKeys::Nine, false, false);
     Map(ResetAction, EKeys::R, false, false);
     Map(ResetAction, EKeys::Gamepad_Special_Left, false, false);
 }
@@ -202,6 +204,7 @@ void AArachnePlayerCharacter::SetupPlayerInputComponent(UInputComponent* Input)
     EIC->BindAction(SprintAction, ETriggerEvent::Completed, this, &AArachnePlayerCharacter::OnSprintOff);
     EIC->BindAction(FlashlightAction, ETriggerEvent::Started, this, &AArachnePlayerCharacter::OnFlashlight);
     EIC->BindAction(DebugAction, ETriggerEvent::Started, this, &AArachnePlayerCharacter::OnDebug);
+    EIC->BindAction(IgnoreAction, ETriggerEvent::Started, this, &AArachnePlayerCharacter::OnIgnoreToggle);
     EIC->BindAction(ResetAction, ETriggerEvent::Started, this, &AArachnePlayerCharacter::OnReset);
 }
 
@@ -226,4 +229,5 @@ void AArachnePlayerCharacter::OnSprintOn(const FInputActionValue&) { ApplySprint
 void AArachnePlayerCharacter::OnSprintOff(const FInputActionValue&) { ApplySprint(false); }
 void AArachnePlayerCharacter::OnFlashlight(const FInputActionValue&) { if (!bCaught) SetFlashlight(!IsFlashlightOn()); }
 void AArachnePlayerCharacter::OnDebug(const FInputActionValue&) { ArachneDebug::Toggle(); }
+void AArachnePlayerCharacter::OnIgnoreToggle(const FInputActionValue&) { ArachneDebug::ToggleIgnorePlayer(); }
 void AArachnePlayerCharacter::OnReset(const FInputActionValue&) { RestartLevel(); }

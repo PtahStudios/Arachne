@@ -43,6 +43,8 @@ public:
     // ---------------------------------------------------------------- patrol / camp
     /** Chance after each patrol stop to go camping instead of walking on. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Brain|Patrol", meta=(ClampMin="0", ClampMax="1")) float CampChance = .35f;
+    /** Nearer patrol destinations are more likely: weight = 1 / (1 + distance / falloff). Larger = roams the whole house. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Brain|Patrol", meta=(ClampMin="100")) float PatrolDistanceFalloff = 1500.f;
     /** Recently visited waypoints are avoided when picking the next one. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Brain|Patrol", meta=(ClampMin="0")) int32 AvoidRecentWaypoints = 3;
     /** Idle stillness at patrol stops (0 lively .. 1 frozen). */

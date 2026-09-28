@@ -76,6 +76,7 @@ void AArachnePawn::BeginPlay()
     if (Rig.Initialize(Cast<USkeletalMesh>(SpiderMesh->GetSkinnedAsset())))
         UE_LOG(LogArachne, Display, TEXT("ARACHNE: rig ready, %d IK chains, %d bones"), Rig.Legs.Num(), Rig.ReferenceCS.Num());
 
+    DefaultCollisionRadius = Collision->GetUnscaledSphereRadius();
     SpawnLocation = GetActorLocation();
     SpawnRotation = GetActorRotation();
     ResetCrawler(SpawnLocation, SpawnRotation);
@@ -145,6 +146,9 @@ void AArachnePawn::ResetCrawler(FVector Location, FRotator Rotation)
     SupportPoint = Location - SurfaceUp * BodyHeight;
     Velocity = TravelVelocity = PrevTravelVelocity = FVector::ZeroVector;
     Transition = FArachneTransition();
+    LeftSurfaceUp = FVector::ZeroVector;
+    SinceTransition = 100.f;
+    EndPassage();
     bAnchored = false;
     AnchorFeet.Reset();
     FootFitWeight = 1.f;
@@ -207,6 +211,7 @@ void AArachnePawn::AddImpulse(FVector Impulse)
 
 void AArachnePawn::BeginAnchor(const FArachneAnchor& InAnchor)
 {
+    EndPassage();
     Anchor = InAnchor;
     Anchor.Body.SetScale3D(FVector::OneVector);
     bAnchored = true;
@@ -276,6 +281,40 @@ void AArachnePawn::ComputeAnchorFeet()
         Hit.Normal = Hit.ImpactNormal = N;
         AnchorFeet[I] = Hit;
     }
+}
+
+// =====================================================================================================================
+// Doorways
+// =====================================================================================================================
+
+void AArachnePawn::BeginPassage(FVector Center, FVector Direction, float HalfWidth)
+{
+    bPassage = true;
+    PassageCenter = Center;
+    PassageDir = Direction.GetSafeNormal2D();
+    if (PassageDir.IsNearlyZero()) PassageDir = Facing.GetSafeNormal2D();
+    PassageHalfWidth = FMath::Max(HalfWidth, 20.f);
+    Collision->SetSphereRadius(FMath::Min(DefaultCollisionRadius, PassageCollisionRadius));
+}
+
+void AArachnePawn::EndPassage()
+{
+    if (!bPassage) return;
+    bPassage = false;
+    Collision->SetSphereRadius(DefaultCollisionRadius);
+}
+
+FVector AArachnePawn::ClampToPassage(const FVector& Home) const
+{
+    if (!bPassage) return Home;
+    const FVector Offset = Home - PassageCenter;
+    // Only feet near the door plane are squeezed; in the rooms either side they spread freely.
+    if (FMath::Abs(FVector::DotProduct(Offset, PassageDir)) > 60.0) return Home;
+    const FVector Right = FVector::CrossProduct(FVector::UpVector, PassageDir);
+    const double Lateral = FVector::DotProduct(Offset, Right);
+    const double Limit = FMath::Max(8.0, PassageHalfWidth - PassageFootMargin);
+    if (FMath::Abs(Lateral) <= Limit) return Home;
+    return Home - Right * (Lateral - FMath::Sign(Lateral) * Limit);
 }
 
 // =====================================================================================================================
@@ -399,6 +438,11 @@ void AArachnePawn::BeginTransition(const FVector& Pivot, const FVector& NewUp, c
     SetBodySupport(nullptr);
 }
 
+bool AArachnePawn::IsReturnBlocked(const FVector& NewUp) const
+{
+    return SinceTransition < ReturnTransitionDelay && !LeftSurfaceUp.IsNearlyZero() && FVector::DotProduct(NewUp, LeftSurfaceUp) > .9;
+}
+
 void AArachnePawn::Land(const FHitResult& Hit)
 {
     const FVector N = Hit.ImpactNormal;
@@ -426,6 +470,7 @@ void AArachnePawn::SimulateStep(float Dt)
 {
     AttachCooldown = FMath::Max(0.f, AttachCooldown - Dt);
     LandingBoost = FMath::Max(0.f, LandingBoost - Dt);
+    SinceTransition += Dt;
     if (bAnchored) StepAnchored(Dt);
     else if (Transition.bActive) StepTransition(Dt);
     else if (bAttached) StepAttached(Dt);
@@ -473,14 +518,15 @@ void AArachnePawn::StepAttached(float Dt)
     const double SteepCos = FMath::Cos(FMath::DegreesToRadians(TransitionMinAngle));
 
     // 1. Inner corner ahead: roll up onto it along an arc that starts CornerLead before contact.
-    if (bWants && !MoveDir.IsNearlyZero())
+    if (bWants && !bPassage && !MoveDir.IsNearlyZero())
     {
         FHitResult Wall;
         if (Probe(C, C + MoveDir * (BodyHeight + CornerLead + Speed * Dt), Wall, 8.f))
         {
             const double Cos = FVector::DotProduct(Wall.ImpactNormal, Up);
             const double Dist = FVector::DotProduct(C - Wall.ImpactPoint, Wall.ImpactNormal);
-            if (Cos < SteepCos && FVector::DotProduct(Wall.ImpactNormal, MoveDir) < -.2 && Dist <= BodyHeight + CornerLead && !IsStepUp(Wall))
+            if (Cos < SteepCos && FVector::DotProduct(Wall.ImpactNormal, MoveDir) < -.2 && Dist <= BodyHeight + CornerLead && !IsStepUp(Wall) &&
+                !IsReturnBlocked(Wall.ImpactNormal))
             {
                 const double Rho = FMath::Max(10.0, (Dist - BodyHeight) / FMath::Max(1.0 - Cos, .2));
                 BeginTransition(C + Up * Rho, Wall.ImpactNormal, MoveDir, false, Wall.GetComponent());
@@ -537,7 +583,7 @@ void AArachnePawn::StepAttached(float Dt)
         const FVector EdgeDir = !MoveDir.IsNearlyZero() ? MoveDir : Facing;
         FHitResult Face;
         FVector Edge;
-        if (bWants && FindConvexEdge(EdgeDir, Face, Edge))
+        if (bWants && !bPassage && FindConvexEdge(EdgeDir, Face, Edge))
         {
             BeginTransition(Edge, Face.ImpactNormal, EdgeDir, true, Face.GetComponent());
             if (Transition.bActive) return;
@@ -559,7 +605,12 @@ void AArachnePawn::StepAttached(float Dt)
     {
         // Blocked by something the probes missed (low wall, lip of a box): climb it.
         const double Cos = FVector::DotProduct(Block.ImpactNormal, SurfaceUp);
-        if (Cos < SteepCos && FVector::DotProduct(Block.ImpactNormal, MoveDir) < -.1)
+        if (bPassage || IsReturnBlocked(Block.ImpactNormal))
+        {
+            // Door jamb, or the surface we just left: slide along it instead of rolling onto it.
+            Velocity = FVector::VectorPlaneProject(Velocity, Block.ImpactNormal);
+        }
+        else if (Cos < SteepCos && FVector::DotProduct(Block.ImpactNormal, MoveDir) < -.1)
         {
             const FVector P = GetActorLocation();
             const double Dist = FVector::DotProduct(P - Block.ImpactPoint, Block.ImpactNormal);
@@ -609,6 +660,7 @@ void AArachnePawn::StepTransition(float Dt)
     {
         T.bActive = false;
         bAttached = true;
+        if (!T.bConvex) { LeftSurfaceUp = T.Up0; SinceTransition = 0.f; }
         SurfaceUp = T.Up1;
         SupportNormal = T.Up1;
         SetBodySupport(T.Support.Get());
@@ -686,7 +738,11 @@ bool AArachnePawn::FindFoot(const FArachneLeg& Leg, const FVector& Home, FHitRes
     const FVector Up = SurfaceUp;
     const FVector Hip = Base.TransformPosition(Leg.Rest[2]);
     const double Reach = Leg.Reach * .98;
-    auto Reachable = [&](const FHitResult& H) { return FVector::Dist(Hip, H.ImpactPoint) <= Reach; };
+    // In a doorway feet only take the floor: grabbing a jamb would twist the body into the frame.
+    auto Reachable = [&](const FHitResult& H)
+    {
+        return FVector::Dist(Hip, H.ImpactPoint) <= Reach && (!bPassage || FVector::DotProduct(H.ImpactNormal, Up) > .6);
+    };
 
     const FVector Above = Home + Up * 55.0;
     const FVector Below = Home - Up * FootProbeReach;
@@ -820,7 +876,7 @@ void AArachnePawn::UpdateGroundedLegs(float Dt)
         const FVector Dir = Speed > 1.0 ? Velocity / Speed : FVector::ZeroVector;
         const FVector Lead = (Velocity * Remaining + Dir * (Threshold * .5 * StepLead)).GetClampedToMaxSize(Threshold * 1.3);
         const FQuat Turn(Up, YawRate * Remaining * 1.5f);
-        return C + Turn.RotateVector(Home - C) + Lead;
+        return ClampToPassage(C + Turn.RotateVector(Home - C) + Lead);
     };
 
     // 1. Which legs want to step, most urgent first.
@@ -831,10 +887,11 @@ void AArachnePawn::UpdateGroundedLegs(float Dt)
         const FArachneLeg& L = Legs[I];
         if (L.bSwinging) continue;
         if (!L.bPlanted) { Candidates.Add({I, 100.0}); continue; }
-        const FVector Home = Base.TransformPosition(L.Rest.Last());
+        const FVector Home = ClampToPassage(Base.TransformPosition(L.Rest.Last()));
         const FVector Hip = Base.TransformPosition(L.Rest[2]);
         const FVector Offset = L.Plant - Home;
         double Err = FMath::Max(FVector::VectorPlaneProject(Offset, Up).Size(), FMath::Abs(FVector::DotProduct(Offset, Up)) * .8);
+        if (bPassage && FVector::DotProduct(L.PlantNormal, Up) < .6) Err = Threshold * 3.0;   // let go of jambs
         const bool bOverReach = FVector::Dist(Hip, L.Plant) > L.Reach * .97;
         if (!L.Support.IsValid()) Err = Threshold * 3.0;   // virtual plant or support destroyed: re-plant on real geometry
         const double Limit = bSettling ? IdleSettleDistance : Threshold;
@@ -853,7 +910,7 @@ void AArachnePawn::UpdateGroundedLegs(float Dt)
         if (!FindFoot(L, PredictHome(L, SwingTime), Hit))
         {
             // Nothing reachable to stand on: let a loose foot hang towards its rest pose instead of freezing.
-            if (!L.bPlanted) L.Foot = FMath::Lerp(L.Foot, Base.TransformPosition(L.Rest.Last()) + Up * 8.0, Damp(8.0, Dt));
+            if (!L.bPlanted) L.Foot = FMath::Lerp(L.Foot, ClampToPassage(Base.TransformPosition(L.Rest.Last())) + Up * 8.0, Damp(8.0, Dt));
             continue;
         }
         if (BeginSwing(Cand.Index, Hit, SwingTime)) ++Swinging;
@@ -1017,6 +1074,11 @@ void AArachnePawn::DrawBodyDebug() const
     {
         DrawDebugSphere(World, L.Foot, 4.f, 8, L.bPlanted ? FColor::Green : FColor::Orange, false, 0.f);
         if (L.bSwinging) DrawDebugSphere(World, L.Target, 3.f, 6, FColor::Blue, false, 0.f);
+    }
+    if (bPassage)
+    {
+        const FVector Right = FVector::CrossProduct(FVector::UpVector, PassageDir) * PassageHalfWidth;
+        DrawDebugLine(World, PassageCenter - Right, PassageCenter + Right, FColor(120, 220, 255), false, 0.f, 0, 3.f);
     }
     if (bAnchored)
     {

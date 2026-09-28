@@ -47,7 +47,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Senses|Touch") float TouchRadius = 160.f;
 
     // ---------------------------------------------------------------- debug
-    /** Always draw the senses (F1 / Arachne.Debug draws them too). */
+    /** Always draw the senses (key 0 / Arachne.Debug draws them too). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Senses|Debug") bool bDebug = false;
 
     /** Runtime multiplier on all ranges (the brain raises it while camping). */

@@ -5,7 +5,7 @@
 
 class AArachnePlayerCharacter;
 
-/** Controls line, the "caught" screen with a reset button, and the debug readout (F1). */
+/** Controls line, the "caught" screen with a reset button, and the debug readout (0). */
 UCLASS()
 class ARACHNE_API AArachneHUD : public AHUD
 {
