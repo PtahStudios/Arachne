@@ -1,61 +1,28 @@
-#include "ArachnePawn.h"
+#include "Creature/ArachnePawn.h"
+#include "Creature/ArachneMath.h"
+#include "AI/ArachneSensesComponent.h"
+#include "AI/ArachneMemoryComponent.h"
+#include "AI/ArachneNavigatorComponent.h"
+#include "AI/ArachneBrainComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/PoseableMeshComponent.h"
-#include "Camera/CameraComponent.h"
-#include "GameFramework/SpringArmComponent.h"
-#include "GameFramework/PlayerController.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
-#include "Engine/LocalPlayer.h"
 #include "DrawDebugHelpers.h"
-#include "EnhancedInputComponent.h"
-#include "EnhancedInputSubsystems.h"
-#include "InputMappingContext.h"
-#include "InputAction.h"
-#include "InputModifiers.h"
-#include "InputActionValue.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogArachne, Log, All);
 
-namespace ArachneMath
-{
-    static double Damp(double Rate, double Dt) { return 1.0 - FMath::Exp(-Rate * Dt); }
-
-    static FVector PlaneDir(const FVector& V, const FVector& Normal, const FVector& Fallback)
-    {
-        const FVector P = FVector::VectorPlaneProject(V, Normal).GetSafeNormal();
-        return P.IsNearlyZero() ? Fallback : P;
-    }
-
-    static double SignedAngleAround(const FVector& From, const FVector& To, const FVector& Axis)
-    {
-        const FVector A = FVector::VectorPlaneProject(From, Axis).GetSafeNormal();
-        const FVector B = FVector::VectorPlaneProject(To, Axis).GetSafeNormal();
-        if (A.IsNearlyZero() || B.IsNearlyZero()) return 0.0;
-        return FMath::Atan2(FVector::DotProduct(FVector::CrossProduct(A, B), Axis), FVector::DotProduct(A, B));
-    }
-
-    static FVector SlerpNormal(const FVector& From, const FVector& To, double Alpha)
-    {
-        const FQuat Full = FQuat::FindBetweenNormals(From, To);
-        return FQuat::Slerp(FQuat::Identity, Full, Alpha).RotateVector(From).GetSafeNormal();
-    }
-
-    /** Rigid rotation Q about a pivot point, as a transform applied after a component-space pose. */
-    static FTransform RotateAbout(const FVector& Pivot, const FQuat& Q)
-    {
-        return FTransform(Q, Pivot - Q.RotateVector(Pivot));
-    }
-}
 using namespace ArachneMath;
 
 static const TCHAR* ArachneMeshPath = TEXT("/Game/ARACHNE/Characters/SK_Arachne.SK_Arachne");
 
-void FArachneSpring::Step(const FVector& Target, double Frequency, double Damping, double Dt)
+/** Wave gait rule: a leg never lifts while a neighbour (same side front/back, or its opposite) is in the air. */
+static bool NeighbourSwinging(const TArray<FArachneLeg>& Legs, int32 Index)
 {
-    const double W = 2.0 * PI * Frequency;
-    V += ((Target - X) * (W * W) - V * (2.0 * Damping * W)) * Dt;
-    X += V * Dt;
+    const int32 Pair = Index / 2, Side = Index % 2;
+    const int32 N[3] = {(Pair - 1) * 2 + Side, (Pair + 1) * 2 + Side, Pair * 2 + (1 - Side)};
+    for (const int32 K : N) if (K >= 0 && K < Legs.Num() && Legs[K].bSwinging) return true;
+    return false;
 }
 
 // =====================================================================================================================
@@ -65,7 +32,7 @@ void FArachneSpring::Step(const FVector& Target, double Frequency, double Dampin
 AArachnePawn::AArachnePawn()
 {
     PrimaryActorTick.bCanEverTick = true;
-    PrimaryActorTick.TickGroup = TG_PostPhysics;   // movers/platforms have already moved this frame
+    PrimaryActorTick.TickGroup = TG_PostPhysics;   // movers/platforms have already moved this frame; AI components tick before
 
     Collision = CreateDefaultSubobject<USphereComponent>(TEXT("BodyCollision"));
     SetRootComponent(Collision);
@@ -80,171 +47,87 @@ AArachnePawn::AArachnePawn()
     SpiderMesh->SetCanEverAffectNavigation(false);
     SpiderMesh->BoundsScale = 1.8f;
 
-    CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("SurfaceCameraBoom"));
-    CameraBoom->SetupAttachment(Collision);
-    CameraBoom->SetRelativeLocation(FVector(0, 0, 55));
-    CameraBoom->SetUsingAbsoluteRotation(true);
-    CameraBoom->TargetArmLength = DesiredArmLength;
-    CameraBoom->bEnableCameraLag = true;
-    CameraBoom->CameraLagSpeed = 10.f;
-    CameraBoom->bEnableCameraRotationLag = true;
-    CameraBoom->CameraRotationLagSpeed = 9.f;
-    CameraBoom->ProbeSize = 14.f;
-    CameraBoom->bUsePawnControlRotation = false;
+    Senses = CreateDefaultSubobject<UArachneSensesComponent>(TEXT("Senses"));
+    Memory = CreateDefaultSubobject<UArachneMemoryComponent>(TEXT("Memory"));
+    Navigator = CreateDefaultSubobject<UArachneNavigatorComponent>(TEXT("Navigator"));
+    Brain = CreateDefaultSubobject<UArachneBrainComponent>(TEXT("Brain"));
 
-    Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
-    Camera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
-    Camera->FieldOfView = 85.f;
+    AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;
+}
 
-    AutoPossessAI = EAutoPossessAI::Disabled;
-
-    for (int32 S = 0; S < 2; ++S)
-    {
-        for (int32 K = 0; K < 4; ++K) { PalpBones[S][K] = INDEX_NONE; PalpPivots[S][K] = FVector::ZeroVector; }
-    }
+void AArachnePawn::LoadSpiderAsset()
+{
+    if (!SpiderAsset) SpiderAsset = LoadObject<USkeletalMesh>(nullptr, ArachneMeshPath, nullptr, LOAD_NoWarn);
+    if (SpiderAsset && SpiderMesh->GetSkinnedAsset() != SpiderAsset) SpiderMesh->SetSkinnedAssetAndUpdate(SpiderAsset);
 }
 
 void AArachnePawn::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    if (!SpiderAsset) SpiderAsset = LoadObject<USkeletalMesh>(nullptr, ArachneMeshPath, nullptr, LOAD_NoWarn);
-    if (SpiderAsset && SpiderMesh->GetSkinnedAsset() != SpiderAsset) SpiderMesh->SetSkinnedAssetAndUpdate(SpiderAsset);
+    LoadSpiderAsset();
     SpiderMesh->SetRelativeLocationAndRotation(FVector(0, 0, -BodyHeight), FQuat::Identity);
 }
 
 void AArachnePawn::BeginPlay()
 {
     Super::BeginPlay();
-    if (!SpiderAsset) SpiderAsset = LoadObject<USkeletalMesh>(nullptr, ArachneMeshPath, nullptr, LOAD_NoWarn);
-    if (SpiderAsset && SpiderMesh->GetSkinnedAsset() != SpiderAsset) SpiderMesh->SetSkinnedAssetAndUpdate(SpiderAsset);
+    LoadSpiderAsset();
     if (!SpiderAsset) UE_LOG(LogArachne, Error, TEXT("ARACHNE: %s missing - run Scripts/setup_arachne.py"), ArachneMeshPath);
+    if (Rig.Initialize(Cast<USkeletalMesh>(SpiderMesh->GetSkinnedAsset())))
+        UE_LOG(LogArachne, Display, TEXT("ARACHNE: rig ready, %d IK chains, %d bones"), Rig.Legs.Num(), Rig.ReferenceCS.Num());
 
     SpawnLocation = GetActorLocation();
     SpawnRotation = GetActorRotation();
-    InitializeRig();
     ResetCrawler(SpawnLocation, SpawnRotation);
-
-    if (APlayerController* PC = Cast<APlayerController>(GetController()))
-    {
-        PC->SetInputMode(FInputModeGameOnly());
-        PC->bShowMouseCursor = false;
-    }
 }
 
 // =====================================================================================================================
-// Input (Enhanced Input, created at runtime so the project needs no input assets)
+// Steering
 // =====================================================================================================================
 
-void AArachnePawn::EnsureInputAssets()
+void AArachnePawn::SetMoveDirection(FVector WorldDirection)
 {
-    if (InputContext) return;
-
-    auto MakeAction = [this](const TCHAR* Name, EInputActionValueType Type)
-    {
-        UInputAction* Action = NewObject<UInputAction>(this, Name);
-        Action->ValueType = Type;
-        return Action;
-    };
-    MoveAction   = MakeAction(TEXT("IA_ArachneMove"), EInputActionValueType::Axis2D);
-    LookAction   = MakeAction(TEXT("IA_ArachneLook"), EInputActionValueType::Axis2D);
-    ZoomAction   = MakeAction(TEXT("IA_ArachneZoom"), EInputActionValueType::Axis1D);
-    SprintAction = MakeAction(TEXT("IA_ArachneSprint"), EInputActionValueType::Boolean);
-    JumpAction   = MakeAction(TEXT("IA_ArachneJump"), EInputActionValueType::Boolean);
-    DebugAction  = MakeAction(TEXT("IA_ArachneDebug"), EInputActionValueType::Boolean);
-    ResetAction  = MakeAction(TEXT("IA_ArachneReset"), EInputActionValueType::Boolean);
-
-    InputContext = NewObject<UInputMappingContext>(this, TEXT("IMC_Arachne"));
-    auto Map = [this](UInputAction* Action, const FKey& Key, bool bSwizzle, bool bNegate) -> FEnhancedActionKeyMapping&
-    {
-        FEnhancedActionKeyMapping& Mapping = InputContext->MapKey(Action, Key);
-        if (bSwizzle) Mapping.Modifiers.Add(NewObject<UInputModifierSwizzleAxis>(InputContext));  // default order YXZ
-        if (bNegate) Mapping.Modifiers.Add(NewObject<UInputModifierNegate>(InputContext));
-        return Mapping;
-    };
-    // Move: X = forward, Y = right
-    Map(MoveAction, EKeys::W, false, false);
-    Map(MoveAction, EKeys::S, false, true);
-    Map(MoveAction, EKeys::D, true, false);
-    Map(MoveAction, EKeys::A, true, true);
-    {
-        FEnhancedActionKeyMapping& Stick = Map(MoveAction, EKeys::Gamepad_Left2D, true, false);
-        Stick.Modifiers.Insert(NewObject<UInputModifierDeadZone>(InputContext), 0);
-    }
-    Map(LookAction, EKeys::Mouse2D, false, false);
-    {
-        FEnhancedActionKeyMapping& Stick = Map(LookAction, EKeys::Gamepad_Right2D, false, false);
-        Stick.Modifiers.Add(NewObject<UInputModifierDeadZone>(InputContext));
-        Stick.Modifiers.Add(NewObject<UInputModifierScaleByDeltaTime>(InputContext));
-        UInputModifierScalar* Scalar = NewObject<UInputModifierScalar>(InputContext);
-        Scalar->Scalar = FVector(60.0, 45.0, 1.0);
-        Stick.Modifiers.Add(Scalar);
-    }
-    Map(ZoomAction, EKeys::MouseWheelAxis, false, false);
-    Map(SprintAction, EKeys::LeftShift, false, false);
-    Map(SprintAction, EKeys::Gamepad_LeftThumbstick, false, false);
-    Map(JumpAction, EKeys::SpaceBar, false, false);
-    Map(JumpAction, EKeys::Gamepad_FaceButton_Bottom, false, false);
-    Map(DebugAction, EKeys::F1, false, false);
-    Map(ResetAction, EKeys::R, false, false);
-    Map(ResetAction, EKeys::Gamepad_Special_Left, false, false);
+    WorldMove = WorldDirection.GetClampedToMaxSize(1.0);
+    bWorldMove = true;
 }
-
-void AArachnePawn::NotifyControllerChanged()
-{
-    Super::NotifyControllerChanged();
-    EnsureInputAssets();
-    if (APlayerController* PC = Cast<APlayerController>(Controller))
-    {
-        if (ULocalPlayer* LocalPlayer = PC->GetLocalPlayer())
-        {
-            if (UEnhancedInputLocalPlayerSubsystem* Subsystem = LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>())
-            {
-                Subsystem->RemoveMappingContext(InputContext);
-                Subsystem->AddMappingContext(InputContext, 0);
-            }
-        }
-    }
-}
-
-void AArachnePawn::SetupPlayerInputComponent(UInputComponent* Input)
-{
-    Super::SetupPlayerInputComponent(Input);
-    EnsureInputAssets();
-    UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(Input);
-    if (!EIC)
-    {
-        UE_LOG(LogArachne, Error, TEXT("ARACHNE: Enhanced Input component required (Project Settings > Input > Default Input Component Class)"));
-        return;
-    }
-    EIC->BindAction(MoveAction, ETriggerEvent::Triggered, this, &AArachnePawn::OnMove);
-    EIC->BindAction(MoveAction, ETriggerEvent::Completed, this, &AArachnePawn::OnMoveStop);
-    EIC->BindAction(LookAction, ETriggerEvent::Triggered, this, &AArachnePawn::OnLook);
-    EIC->BindAction(ZoomAction, ETriggerEvent::Triggered, this, &AArachnePawn::OnZoom);
-    EIC->BindAction(SprintAction, ETriggerEvent::Started, this, &AArachnePawn::OnSprintOn);
-    EIC->BindAction(SprintAction, ETriggerEvent::Completed, this, &AArachnePawn::OnSprintOff);
-    EIC->BindAction(JumpAction, ETriggerEvent::Started, this, &AArachnePawn::OnJump);
-    EIC->BindAction(DebugAction, ETriggerEvent::Started, this, &AArachnePawn::OnDebug);
-    EIC->BindAction(ResetAction, ETriggerEvent::Started, this, &AArachnePawn::OnReset);
-}
-
-void AArachnePawn::OnMove(const FInputActionValue& Value) { const FVector2D V = Value.Get<FVector2D>(); SetMovementInput(V.X, V.Y); }
-void AArachnePawn::OnMoveStop(const FInputActionValue&) { MoveInput = FVector2D::ZeroVector; }
-void AArachnePawn::OnLook(const FInputActionValue& Value)
-{
-    const FVector2D V = Value.Get<FVector2D>();
-    ViewHeading = FQuat(SurfaceUp, FMath::DegreesToRadians(V.X * 2.2 * MouseSensitivity)).RotateVector(ViewHeading);
-    CameraPitch = FMath::Clamp(CameraPitch + static_cast<float>(V.Y) * 1.6f * MouseSensitivity, -78.f, 40.f);
-}
-void AArachnePawn::OnZoom(const FInputActionValue& Value) { DesiredArmLength = FMath::Clamp(DesiredArmLength - Value.Get<float>() * 45.f, 260.f, 950.f); }
-void AArachnePawn::OnSprintOn(const FInputActionValue&) { bSprint = true; }
-void AArachnePawn::OnSprintOff(const FInputActionValue&) { bSprint = false; }
-void AArachnePawn::OnJump(const FInputActionValue&) { Jump(); }
-void AArachnePawn::OnDebug(const FInputActionValue&) { bShowDebug = !bShowDebug; }
-void AArachnePawn::OnReset(const FInputActionValue&) { ResetCrawler(SpawnLocation, SpawnRotation); }
 
 void AArachnePawn::SetMovementInput(float Forward, float Right)
 {
     MoveInput = FVector2D(Forward, Right).GetClampedToMaxSize(1.0);
+    bWorldMove = false;
+}
+
+void AArachnePawn::SetFacingDirection(FVector WorldDirection)
+{
+    FacingOverride = WorldDirection.GetSafeNormal();
+}
+
+FVector AArachnePawn::GetEyeLocation() const
+{
+    const FVector Right = FVector::CrossProduct(SurfaceUp, Facing);
+    return GetActorLocation() + Facing * EyeOffset.X + Right * EyeOffset.Y + SurfaceUp * EyeOffset.Z;
+}
+
+FVector AArachnePawn::WishDirection() const
+{
+    if (bWorldMove)
+    {
+        const double Size = WorldMove.Size();
+        if (Size < 1e-3) return FVector::ZeroVector;
+        const FVector P = FVector::VectorPlaneProject(WorldMove, SurfaceUp);
+        const double Len = P.Size();
+        // A request pointing (almost) straight into / out of the surface has no usable direction on it.
+        return Len > .05 * Size ? P / Len * FMath::Min(Size, 1.0) : FVector::ZeroVector;
+    }
+    const FVector Fwd = PlaneDir(Heading, SurfaceUp, Facing);
+    const FVector Right = FVector::CrossProduct(SurfaceUp, Fwd);
+    return (Fwd * MoveInput.X + Right * MoveInput.Y).GetClampedToMaxSize(1.0);
+}
+
+void AArachnePawn::TurnFacing(const FVector& Target, float Dt)
+{
+    const double Yaw = SignedAngleAround(Facing, Target, SurfaceUp);
+    Facing = FQuat(SurfaceUp, Yaw * Damp(FacingTurnSpeed, Dt)).RotateVector(Facing);
 }
 
 // =====================================================================================================================
@@ -256,13 +139,15 @@ void AArachnePawn::ResetCrawler(FVector Location, FRotator Rotation)
     SetActorLocationAndRotation(Location, Rotation, false, nullptr, ETeleportType::TeleportPhysics);
     Facing = GetActorForwardVector();
     SurfaceUp = GetActorUpVector();
-    ViewHeading = Facing;
+    Heading = Facing;
     PrevFacing = Facing;
-    CameraUp = SurfaceUp;
     SupportNormal = SurfaceUp;
     SupportPoint = Location - SurfaceUp * BodyHeight;
     Velocity = TravelVelocity = PrevTravelVelocity = FVector::ZeroVector;
     Transition = FArachneTransition();
+    bAnchored = false;
+    AnchorFeet.Reset();
+    FootFitWeight = 1.f;
     SetBodySupport(nullptr);
     UnsupportedTime = AttachCooldown = LandingBoost = IdleTime = 0.f;
     BodyOffsetSpring.Reset();
@@ -279,9 +164,9 @@ void AArachnePawn::ResetCrawler(FVector Location, FRotator Rotation)
     }
 
     const FTransform Base = BaseMeshTransform();
-    for (int32 I = 0; I < Legs.Num(); ++I)
+    for (int32 I = 0; I < Rig.Legs.Num(); ++I)
     {
-        FArachneLeg& L = Legs[I];
+        FArachneLeg& L = Rig.Legs[I];
         L.Foot = Base.TransformPosition(L.Rest.Last());
         L.bPlanted = L.bSwinging = false;
         L.Swing = 1.f;
@@ -297,23 +182,11 @@ void AArachnePawn::ResetCrawler(FVector Location, FRotator Rotation)
             PlantLeg(I, false);
         }
     }
-    CameraBoom->SetWorldRotation(FRotationMatrix::MakeFromXZ(Facing, SurfaceUp).ToQuat() * FRotator(CameraPitch, 0, 0).Quaternion());
-}
-
-void AArachnePawn::Jump()
-{
-    if (!(bAttached || Transition.bActive) || AttachCooldown > 0.f) return;
-    const FVector Up = SurfaceUp;
-    Velocity = FVector::VectorPlaneProject(Velocity, Up) + Up * JumpSpeed + WishDirection() * JumpForwardBoost;
-    Detach();
-    AttachCooldown = .22f;
-    BodyOffsetSpring.V.Z -= 160.0;            // compress, the spring throws the body up with the jump
-    for (FArachneLeg& L : Legs) { L.bPlanted = L.bSwinging = false; L.AirVelocity = -Velocity * .15; }
-    OnJumped.Broadcast();
 }
 
 void AArachnePawn::AddImpulse(FVector Impulse)
 {
+    if (bAnchored) EndAnchor();
     const FVector Local = GetActorTransform().InverseTransformVectorNoScale(Impulse);
     BodyOffsetSpring.V += Local * .35;
     if (!bAttached && !Transition.bActive) { Velocity += Impulse; return; }
@@ -322,10 +195,87 @@ void AArachnePawn::AddImpulse(FVector Impulse)
         Velocity = FVector::VectorPlaneProject(Velocity, SurfaceUp) + Impulse;
         Detach();
         AttachCooldown = .15f;
-        for (FArachneLeg& L : Legs) { L.bPlanted = L.bSwinging = false; L.AirVelocity = FVector::ZeroVector; }
+        for (FArachneLeg& L : Rig.Legs) { L.bPlanted = L.bSwinging = false; L.AirVelocity = FVector::ZeroVector; }
         return;
     }
     Velocity += FVector::VectorPlaneProject(Impulse, SurfaceUp);
+}
+
+// =====================================================================================================================
+// Anchors
+// =====================================================================================================================
+
+void AArachnePawn::BeginAnchor(const FArachneAnchor& InAnchor)
+{
+    Anchor = InAnchor;
+    Anchor.Body.SetScale3D(FVector::OneVector);
+    bAnchored = true;
+    AnchorAlpha = 0.f;
+    AnchorStartLocation = GetActorLocation();
+    AnchorStartRotation = GetActorQuat();
+    Transition.bActive = false;
+    bAttached = true;
+    Velocity = FVector::ZeroVector;
+    SetBodySupport(nullptr);
+    ComputeAnchorFeet();
+}
+
+void AArachnePawn::EndAnchor()
+{
+    if (!bAnchored) return;
+    bAnchored = false;
+    AnchorFeet.Reset();
+    bAttached = true;
+    SupportNormal = SurfaceUp;
+    UnsupportedTime = 0.f;
+    Velocity = FVector::ZeroVector;
+}
+
+bool AArachnePawn::IsAnchorSettled() const
+{
+    if (!bAnchored || AnchorAlpha < 1.f) return false;
+    for (int32 I = 0; I < Rig.Legs.Num(); ++I)
+    {
+        const FArachneLeg& L = Rig.Legs[I];
+        if (AnchorFeet.IsValidIndex(I) && AnchorFeet[I].bBlockingHit && (!L.bPlanted || L.bSwinging)) return false;
+    }
+    return true;
+}
+
+void AArachnePawn::ComputeAnchorFeet()
+{
+    AnchorFeet.Init(FHitResult(), Rig.Legs.Num());
+    const FTransform FinalBase = FTransform(FVector(0, 0, -BodyHeight)) * Anchor.Body;
+    const FVector Up = Anchor.Body.GetRotation().GetUpVector();
+    for (int32 I = 0; I < Rig.Legs.Num(); ++I)
+    {
+        const FArachneLeg& L = Rig.Legs[I];
+        if (!Anchor.bVirtualSurface)
+        {
+            FHitResult Hit;
+            if (FArachneRig::FindAnchorFoot(GetWorld(), L, FinalBase, Up, this, Hit)) AnchorFeet[I] = Hit;
+            continue;
+        }
+        // Virtual surface: aim each leg from the hip through its rest foot onto the plane, within reach.
+        const FVector N = Anchor.VirtualNormal.GetSafeNormal();
+        const FVector Home = FinalBase.TransformPosition(L.Rest.Last());
+        const FVector Hip = FinalBase.TransformPosition(L.Rest[2]);
+        const FVector Dir = (Home - Hip).GetSafeNormal();
+        FVector P = FVector::PointPlaneProject(Home, Anchor.VirtualPoint, N);
+        const double Den = FVector::DotProduct(Dir, N);
+        if (FMath::Abs(Den) > .1)
+        {
+            const double T = FVector::DotProduct(Anchor.VirtualPoint - Hip, N) / Den;
+            if (T > 0.0) P = Hip + Dir * T;
+        }
+        const double Reach = L.Reach * .97;
+        if (FVector::Dist(Hip, P) > Reach) P = Hip + (P - Hip).GetSafeNormal() * Reach;
+        FHitResult Hit;
+        Hit.bBlockingHit = true;
+        Hit.Location = Hit.ImpactPoint = P;
+        Hit.Normal = Hit.ImpactNormal = N;
+        AnchorFeet[I] = Hit;
+    }
 }
 
 // =====================================================================================================================
@@ -367,7 +317,7 @@ void AArachnePawn::RotateFrame(const FQuat& Delta, bool bRotateVelocity)
 {
     SurfaceUp = Delta.RotateVector(SurfaceUp).GetSafeNormal();
     Facing = PlaneDir(Delta.RotateVector(Facing), SurfaceUp, Facing);
-    ViewHeading = PlaneDir(Delta.RotateVector(ViewHeading), SurfaceUp, Facing);
+    Heading = PlaneDir(Delta.RotateVector(Heading), SurfaceUp, Facing);
     if (bRotateVelocity) Velocity = Delta.RotateVector(Velocity);
 }
 
@@ -375,13 +325,6 @@ void AArachnePawn::ApplyFrame()
 {
     Facing = PlaneDir(Facing, SurfaceUp, FVector::CrossProduct(GetActorRightVector(), SurfaceUp));
     SetActorRotation(FRotationMatrix::MakeFromZX(SurfaceUp, Facing).ToQuat());
-}
-
-FVector AArachnePawn::WishDirection() const
-{
-    const FVector Fwd = PlaneDir(ViewHeading, SurfaceUp, Facing);
-    const FVector Right = FVector::CrossProduct(SurfaceUp, Fwd);
-    return (Fwd * MoveInput.X + Right * MoveInput.Y).GetClampedToMaxSize(1.0);
 }
 
 bool AArachnePawn::MoveBody(const FVector& Delta, FHitResult& Block)
@@ -483,10 +426,27 @@ void AArachnePawn::SimulateStep(float Dt)
 {
     AttachCooldown = FMath::Max(0.f, AttachCooldown - Dt);
     LandingBoost = FMath::Max(0.f, LandingBoost - Dt);
-    if (Transition.bActive) StepTransition(Dt);
+    if (bAnchored) StepAnchored(Dt);
+    else if (Transition.bActive) StepTransition(Dt);
     else if (bAttached) StepAttached(Dt);
     else StepAir(Dt);
     if (GetActorLocation().Z < -8000.0) ResetCrawler(SpawnLocation, SpawnRotation);
+}
+
+void AArachnePawn::StepAnchored(float Dt)
+{
+    const FVector Before = GetActorLocation();
+    AnchorAlpha = FMath::Min(1.f, AnchorAlpha + Dt / FMath::Max(Anchor.BlendTime, .05f));
+    const float A = FMath::SmoothStep(0.f, 1.f, AnchorAlpha);
+    const FVector P = FMath::Lerp(AnchorStartLocation, Anchor.Body.GetLocation(), static_cast<double>(A));
+    const FQuat Q = FQuat::Slerp(AnchorStartRotation, Anchor.Body.GetRotation(), A).GetNormalized();
+    SetActorLocationAndRotation(P, Q, false, nullptr, ETeleportType::None);
+    SurfaceUp = Q.GetUpVector();
+    Facing = Q.GetForwardVector();
+    Heading = Facing;
+    Velocity = (P - Before) / FMath::Max(Dt, 1e-4f);
+    bAttached = true;
+    UnsupportedTime = 0.f;
 }
 
 void AArachnePawn::StepAttached(float Dt)
@@ -501,13 +461,11 @@ void AArachnePawn::StepAttached(float Dt)
     Velocity = FVector::VectorPlaneProject(Velocity, Up);
     Velocity += (Wish * MaxSpeed - Velocity) * Damp(bWants ? Acceleration : Deceleration, Dt);
 
-    // Body faces the camera heading while travelling; strafing is a crab walk.
-    if (bWants)
-    {
-        const FVector ViewFwd = PlaneDir(ViewHeading, Up, Facing);
-        const double Yaw = SignedAngleAround(Facing, ViewFwd, Up);
-        Facing = FQuat(Up, Yaw * Damp(FacingTurnSpeed, Dt)).RotateVector(Facing);
-    }
+    // Facing: an explicit facing request wins (look around, crab walk), otherwise face the way we travel.
+    FVector FaceTarget = FVector::ZeroVector;
+    if (!FacingOverride.IsNearlyZero()) FaceTarget = PlaneDir(FacingOverride, Up, FVector::ZeroVector);
+    else if (bWants) FaceTarget = bWorldMove ? Wish.GetSafeNormal() : PlaneDir(Heading, Up, Facing);
+    if (!FaceTarget.IsNearlyZero()) TurnFacing(FaceTarget, Dt);
 
     const FVector C = GetActorLocation();
     const double Speed = Velocity.Size();
@@ -620,7 +578,9 @@ void AArachnePawn::StepTransition(float Dt)
     const FVector Fwd = QNow.RotateVector(T.Forward0);
 
     // Input along the arc drives it (and can reverse it); sideways input slides along the edge line.
-    const double Want = FVector::DotProduct(Wish, Fwd) * MaxSpeed;
+    double Want = FVector::DotProduct(Wish, Fwd) * MaxSpeed;
+    // AI steering aims at world targets, whose projection can vanish mid-arc: once committed, finish the arc.
+    if (bWorldMove && !Wish.IsNearlyZero()) Want = FMath::Max(Want, MaxSpeed * .5);
     T.Speed += (Want - T.Speed) * Damp(Wish.IsNearlyZero() ? Deceleration : Acceleration, Dt);
     const double Lateral = FVector::DotProduct(Wish, T.Axis) * MaxSpeed * .6;
     T.Pivot += T.Axis * (Lateral * Dt);
@@ -667,7 +627,6 @@ void AArachnePawn::StepAir(float Dt)
 {
     const FVector C = GetActorLocation();
     Velocity += FVector(0, 0, GetWorld()->GetGravityZ() * GravityScale) * Dt;
-    Velocity += WishDirection() * (MoveSpeed * AirControl * Dt);
     Velocity = Velocity.GetClampedToMaxSize(4000.0);
 
     // Reach for whatever we are about to hit; otherwise slowly right ourselves.
@@ -706,110 +665,19 @@ void AArachnePawn::Tick(float DeltaSeconds)
     AnimTime += DeltaSeconds;
     GaitPhase += static_cast<float>(Velocity.Size() / FMath::Max(StepDistance, 1.f)) * DeltaSeconds * PI;
 
-    UpdateCamera(DeltaSeconds);
     UpdateLegs(DeltaSeconds);
     UpdateBodyVisual(DeltaSeconds);
     BuildPose(DeltaSeconds);
-
-    if (bShowDebug)
-    {
-        const FVector P = GetActorLocation();
-        DrawDebugDirectionalArrow(GetWorld(), P, P + SurfaceUp * 110.0, 15.f, bAttached ? FColor::Cyan : FColor::Red, false, 0.f, 0, 3.f);
-        DrawDebugDirectionalArrow(GetWorld(), P, P + Velocity * .4, 12.f, FColor::Orange, false, 0.f, 0, 2.f);
-        if (Transition.bActive)
-        {
-            DrawDebugSphere(GetWorld(), Transition.Pivot, 8.f, 8, Transition.bConvex ? FColor::Magenta : FColor::Yellow, false, 0.f);
-            DrawDebugLine(GetWorld(), Transition.Pivot - Transition.Axis * 120.0, Transition.Pivot + Transition.Axis * 120.0, FColor::Magenta, false, 0.f, 0, 1.5f);
-        }
-    }
+    if (bDebugBody) DrawBodyDebug();
 }
 
 // =====================================================================================================================
-// Camera
-// =====================================================================================================================
-
-void AArachnePawn::UpdateCamera(float Dt)
-{
-    CameraUp = SlerpNormal(CameraUp, SurfaceUp, Damp(CameraUpFollowSpeed, Dt));
-    const FVector Fwd = PlaneDir(ViewHeading, CameraUp, PlaneDir(Facing, CameraUp, FVector::ForwardVector));
-    const FQuat Base = FRotationMatrix::MakeFromXZ(Fwd, CameraUp).ToQuat();
-    CameraBoom->SetWorldRotation(Base * FRotator(CameraPitch, 0, 0).Quaternion());
-    CameraBoom->TargetArmLength = FMath::FInterpTo(CameraBoom->TargetArmLength, DesiredArmLength, Dt, 6.f);
-}
-
-// =====================================================================================================================
-// Rig
+// Legs
 // =====================================================================================================================
 
 FTransform AArachnePawn::BaseMeshTransform() const
 {
     return FTransform(FVector(0, 0, -BodyHeight)) * GetActorTransform();
-}
-
-void AArachnePawn::InitializeRig()
-{
-    Legs.Empty();
-    USkeletalMesh* Asset = Cast<USkeletalMesh>(SpiderMesh->GetSkinnedAsset());
-    if (!Asset) { UE_LOG(LogArachne, Error, TEXT("ARACHNE: skeletal mesh missing")); return; }
-
-    const FReferenceSkeleton& Ref = Asset->GetRefSkeleton();
-    ReferenceCS = Ref.GetRefBonePose();
-    Children.Empty();
-    Children.SetNum(ReferenceCS.Num());
-    for (int32 I = 0; I < ReferenceCS.Num(); ++I)
-    {
-        const int32 Parent = Ref.GetParentIndex(I);
-        if (Parent != INDEX_NONE) { ReferenceCS[I] = ReferenceCS[I] * ReferenceCS[Parent]; Children[Parent].Add(I); }
-    }
-
-    static const TCHAR* Parts[] = {TEXT("coxa"), TEXT("trochanter"), TEXT("femur"), TEXT("patella"), TEXT("tibia"), TEXT("metatarsus"), TEXT("tarsus")};
-    TArray<FArachneLeg> Built;
-    for (int32 Pair = 1; Pair <= 4; ++Pair)
-    {
-        for (int32 Side = 0; Side < 2; ++Side)
-        {
-            FArachneLeg L;
-            L.Pair = Pair;
-            L.Side = Side;
-            const TCHAR* S = Side == 0 ? TEXT("l") : TEXT("r");
-            for (const TCHAR* Part : Parts) L.Bones.Add(Ref.FindBoneIndex(FName(*FString::Printf(TEXT("leg_%02d_%s_%s"), Pair, Part, S))));
-            L.Bones.Add(Ref.FindBoneIndex(FName(*FString::Printf(TEXT("foot_%02d_%s"), Pair, S))));
-            if (L.Bones.Contains(INDEX_NONE)) { UE_LOG(LogArachne, Error, TEXT("ARACHNE: missing leg bones %d %s"), Pair, S); continue; }
-            for (const int32 Bone : L.Bones) L.Rest.Add(ReferenceCS[Bone].GetLocation());
-            for (int32 J = 0; J < 7; ++J) L.Lengths.Add(FVector::Distance(L.Rest[J], L.Rest[J + 1]));
-            for (int32 J = 2; J < 7; ++J) L.Reach += L.Lengths[J];
-            Built.Add(L);
-        }
-    }
-    if (Built.Num() == 8) Legs = Built;
-
-    // Abdomen + everything hanging off it (spinnerets, shields)
-    AbdomenBone = Ref.FindBoneIndex(TEXT("abdomen"));
-    AbdomenSubtree.Empty();
-    if (AbdomenBone != INDEX_NONE)
-    {
-        TArray<int32> Stack = {AbdomenBone};
-        while (Stack.Num()) { const int32 B = Stack.Pop(); AbdomenSubtree.Add(B); Stack.Append(Children[B]); }
-    }
-
-    // Pedipalps. The Blender rig placed the right palp joints on the left side, so mirror the left pivots when needed.
-    for (int32 K = 0; K < 4; ++K)
-    {
-        PalpBones[0][K] = Ref.FindBoneIndex(FName(*FString::Printf(TEXT("pedipalp_%02d_l"), K + 1)));
-        PalpBones[1][K] = Ref.FindBoneIndex(FName(*FString::Printf(TEXT("pedipalp_%02d_r"), K + 1)));
-        for (int32 S = 0; S < 2; ++S)
-            PalpPivots[S][K] = PalpBones[S][K] != INDEX_NONE ? ReferenceCS[PalpBones[S][K]].GetLocation() : FVector::ZeroVector;
-        if (PalpBones[0][K] != INDEX_NONE && PalpBones[1][K] != INDEX_NONE && PalpPivots[0][K].Y * PalpPivots[1][K].Y > 1.0)
-            PalpPivots[1][K] = FVector(PalpPivots[0][K].X, -PalpPivots[0][K].Y, PalpPivots[0][K].Z);
-    }
-    for (int32 S = 0; S < 2; ++S)
-    {
-        ChelBones[S] = Ref.FindBoneIndex(S == 0 ? TEXT("chelicera_l") : TEXT("chelicera_r"));
-        FangBones[S] = Ref.FindBoneIndex(S == 0 ? TEXT("fang_l") : TEXT("fang_r"));
-    }
-
-    UE_LOG(LogArachne, Display, TEXT("ARACHNE: %d IK chains, %d bones, abdomen %d, palps %d/%d"),
-        Legs.Num(), ReferenceCS.Num(), AbdomenBone, PalpBones[0][0], PalpBones[1][0]);
 }
 
 bool AArachnePawn::FindFoot(const FArachneLeg& Leg, const FVector& Home, FHitResult& Hit) const
@@ -835,13 +703,14 @@ bool AArachnePawn::FindFoot(const FArachneLeg& Leg, const FVector& Home, FHitRes
 
 void AArachnePawn::PlantLeg(int32 Index, bool bBroadcast)
 {
-    FArachneLeg& L = Legs[Index];
+    FArachneLeg& L = Rig.Legs[Index];
     L.bSwinging = false;
     L.bPlanted = true;
     L.Swing = 1.f;
     L.Plant = L.Target;
     L.PlantNormal = L.TargetNormal;
     L.Support = L.TargetSupport;
+    L.bVirtualPlant = !L.Support.IsValid();
     if (UPrimitiveComponent* S = L.Support.Get()) L.LocalPlant = S->GetComponentTransform().InverseTransformPosition(L.Plant);
     L.Foot = L.Plant;
     L.PlantedTime = 0.f;
@@ -853,15 +722,88 @@ void AArachnePawn::PlantLeg(int32 Index, bool bBroadcast)
     }
 }
 
+bool AArachnePawn::BeginSwing(int32 Index, const FHitResult& Hit, float SwingTime)
+{
+    FArachneLeg& L = Rig.Legs[Index];
+    const bool bWasPlanted = L.bPlanted;
+    L.Start = L.Foot;
+    L.StartNormal = bWasPlanted ? L.PlantNormal : SurfaceUp;
+    L.Target = Hit.ImpactPoint;
+    L.TargetNormal = Hit.ImpactNormal;
+    L.TargetSupport = Hit.GetComponent();
+    if (UPrimitiveComponent* S = L.TargetSupport.Get()) L.LocalTarget = S->GetComponentTransform().InverseTransformPosition(L.Target);
+    L.SwingLength = static_cast<float>(FVector::Dist(L.Start, L.Target));
+    if (L.SwingLength < 1.5f) { PlantLeg(Index, false); return false; }
+    L.bPlanted = false;
+    L.bSwinging = true;
+    L.Swing = 0.f;
+    L.SwingDuration = bWasPlanted ? SwingTime : SwingTime * .75f;
+    L.SwingHeight = StepHeight * FMath::Clamp(L.SwingLength / FMath::Max(StepDistance, 1.f), .45f, 1.35f);
+    return true;
+}
+
+void AArachnePawn::AdvanceSwing(int32 Index, float Dt)
+{
+    FArachneLeg& L = Rig.Legs[Index];
+    if (UPrimitiveComponent* S = L.TargetSupport.Get()) L.Target = S->GetComponentTransform().TransformPosition(L.LocalTarget);
+    L.Swing = FMath::Min(1.f, L.Swing + Dt / FMath::Max(L.SwingDuration, .05f));
+    const float T = L.Swing;
+    const float Ease = T * T * (3.f - 2.f * T);
+    const float Arc = FMath::Sin(PI * T) * (1.f + .3f * (1.f - T));   // lifts briskly, plants decisively
+    const FVector Lift = (L.StartNormal + L.TargetNormal + SurfaceUp * 1.5).GetSafeNormal();
+    L.Foot = FMath::Lerp(L.Start, L.Target, static_cast<double>(Ease)) + Lift * (L.SwingHeight * Arc);
+    if (T >= 1.f) PlantLeg(Index, true);
+}
+
 void AArachnePawn::UpdateLegs(float Dt)
 {
     if (!IsRigValid()) return;
+    SupportedFeet = 0;
+    for (FArachneLeg& L : Rig.Legs)
+    {
+        if (!L.bPlanted) continue;
+        if (UPrimitiveComponent* S = L.Support.Get()) L.Plant = S->GetComponentTransform().TransformPosition(L.LocalPlant);
+        L.Foot = L.Plant;
+        L.PlantedTime += Dt;
+        ++SupportedFeet;
+    }
+    if (bAnchored) UpdateAnchoredLegs(Dt);
+    else if (bAttached || Transition.bActive) UpdateGroundedLegs(Dt);
+    else UpdateAirLegs(Dt);
+}
+
+void AArachnePawn::UpdateAirLegs(float Dt)
+{
+    // Airborne: legs paddle and reach, each foot on its own critically damped spring.
+    const FTransform Base = BaseMeshTransform();
+    const FVector Up = SurfaceUp;
+    const int32 Sub = FMath::Clamp(FMath::CeilToInt(Dt * 120.f), 1, 8);
+    const double H = Dt / Sub;
+    for (int32 I = 0; I < Rig.Legs.Num(); ++I)
+    {
+        FArachneLeg& L = Rig.Legs[I];
+        L.bPlanted = L.bSwinging = false;
+        const FVector Home = Base.TransformPosition(L.Rest.Last());
+        const FVector Hip = Base.TransformPosition(L.Rest[2]);
+        const double Phase = AnimTime * 11.0 + I * 1.7;
+        const FVector Goal = FMath::Lerp(Home, Hip, .22) + Up * (FMath::Sin(Phase) * 9.0 + 12.0) + (Home - Hip).GetSafeNormal() * (FMath::Cos(Phase) * 7.0);
+        const double W = 2.0 * PI * 5.0;
+        for (int32 S = 0; S < Sub; ++S)
+        {
+            L.AirVelocity += ((Goal - L.Foot) * (W * W) - L.AirVelocity * (2.0 * .75 * W)) * H;
+            L.Foot += L.AirVelocity * H;
+        }
+    }
+}
+
+void AArachnePawn::UpdateGroundedLegs(float Dt)
+{
+    TArray<FArachneLeg>& Legs = Rig.Legs;
     const FTransform Base = BaseMeshTransform();
     const FVector Up = SurfaceUp;
     const FVector C = GetActorLocation();
-    const bool bGrounded = bAttached || Transition.bActive;
     const double Speed = Velocity.Size();
-    const bool bIdle = Speed < 8.0 && FMath::Abs(YawRate) < .25f && bGrounded;
+    const bool bIdle = Speed < 8.0 && FMath::Abs(YawRate) < .25f;
     IdleTime = bIdle ? IdleTime + Dt : 0.f;
     const double SpeedRatio = FMath::Clamp(Speed / FMath::Max(MoveSpeed, 1.f), 0.0, 2.0);
     const float SwingTime = StepDuration / (1.f + .55f * static_cast<float>(SpeedRatio));
@@ -869,41 +811,7 @@ void AArachnePawn::UpdateLegs(float Dt)
     const bool bSettling = IdleTime > .18f;
 
     int32 Swinging = 0;
-    SupportedFeet = 0;
-    for (FArachneLeg& L : Legs)
-    {
-        if (L.bPlanted)
-        {
-            if (UPrimitiveComponent* S = L.Support.Get()) L.Plant = S->GetComponentTransform().TransformPosition(L.LocalPlant);
-            L.Foot = L.Plant;
-            L.PlantedTime += Dt;
-            ++SupportedFeet;
-        }
-        if (L.bSwinging) ++Swinging;
-    }
-
-    if (!bGrounded)
-    {
-        // Airborne: legs paddle and reach, each foot on its own critically damped spring.
-        const int32 Sub = FMath::Clamp(FMath::CeilToInt(Dt * 120.f), 1, 8);
-        const double H = Dt / Sub;
-        for (int32 I = 0; I < Legs.Num(); ++I)
-        {
-            FArachneLeg& L = Legs[I];
-            L.bPlanted = L.bSwinging = false;
-            const FVector Home = Base.TransformPosition(L.Rest.Last());
-            const FVector Hip = Base.TransformPosition(L.Rest[2]);
-            const double Phase = AnimTime * 11.0 + I * 1.7;
-            const FVector Goal = FMath::Lerp(Home, Hip, .22) + Up * (FMath::Sin(Phase) * 9.0 + 12.0) + (Home - Hip).GetSafeNormal() * (FMath::Cos(Phase) * 7.0);
-            const double W = 2.0 * PI * 5.0;
-            for (int32 S = 0; S < Sub; ++S)
-            {
-                L.AirVelocity += ((Goal - L.Foot) * (W * W) - L.AirVelocity * (2.0 * .75 * W)) * H;
-                L.Foot += L.AirVelocity * H;
-            }
-        }
-        return;
-    }
+    for (const FArachneLeg& L : Legs) if (L.bSwinging) ++Swinging;
 
     // Where a leg would like to put its foot, ahead of the body by the distance it travels while the foot is in the air.
     auto PredictHome = [&](const FArachneLeg& L, float Remaining)
@@ -913,13 +821,6 @@ void AArachnePawn::UpdateLegs(float Dt)
         const FVector Lead = (Velocity * Remaining + Dir * (Threshold * .5 * StepLead)).GetClampedToMaxSize(Threshold * 1.3);
         const FQuat Turn(Up, YawRate * Remaining * 1.5f);
         return C + Turn.RotateVector(Home - C) + Lead;
-    };
-    auto NeighbourSwinging = [&](int32 Index)
-    {
-        const int32 Pair = Index / 2, Side = Index % 2;
-        const int32 N[3] = {(Pair - 1) * 2 + Side, (Pair + 1) * 2 + Side, Pair * 2 + (1 - Side)};
-        for (const int32 K : N) if (K >= 0 && K < Legs.Num() && Legs[K].bSwinging) return true;
-        return false;
     };
 
     // 1. Which legs want to step, most urgent first.
@@ -935,7 +836,7 @@ void AArachnePawn::UpdateLegs(float Dt)
         const FVector Offset = L.Plant - Home;
         double Err = FMath::Max(FVector::VectorPlaneProject(Offset, Up).Size(), FMath::Abs(FVector::DotProduct(Offset, Up)) * .8);
         const bool bOverReach = FVector::Dist(Hip, L.Plant) > L.Reach * .97;
-        if (!L.Support.IsValid()) Err = Threshold * 3.0;
+        if (!L.Support.IsValid()) Err = Threshold * 3.0;   // virtual plant or support destroyed: re-plant on real geometry
         const double Limit = bSettling ? IdleSettleDistance : Threshold;
         if (Err > Limit || bOverReach) Candidates.Add({I, Err / Threshold + (bOverReach ? 10.0 : 0.0)});
     }
@@ -945,8 +846,8 @@ void AArachnePawn::UpdateLegs(float Dt)
     {
         if (Swinging >= MaxSwingingLegs) break;
         const bool bUrgent = Cand.Urgency > 2.2;
-        if (bSettling && Swinging > 0 && !bUrgent) break;       // settle shuffle: one leg at a time
-        if (!bUrgent && NeighbourSwinging(Cand.Index)) continue; // wave gait: neighbours never lift together
+        if (bSettling && Swinging > 0 && !bUrgent) break;             // settle shuffle: one leg at a time
+        if (!bUrgent && NeighbourSwinging(Legs, Cand.Index)) continue; // wave gait: neighbours never lift together
         FArachneLeg& L = Legs[Cand.Index];
         FHitResult Hit;
         if (!FindFoot(L, PredictHome(L, SwingTime), Hit))
@@ -955,21 +856,7 @@ void AArachnePawn::UpdateLegs(float Dt)
             if (!L.bPlanted) L.Foot = FMath::Lerp(L.Foot, Base.TransformPosition(L.Rest.Last()) + Up * 8.0, Damp(8.0, Dt));
             continue;
         }
-        const bool bWasPlanted = L.bPlanted;
-        L.Start = L.Foot;
-        L.StartNormal = bWasPlanted ? L.PlantNormal : Up;
-        L.Target = Hit.ImpactPoint;
-        L.TargetNormal = Hit.ImpactNormal;
-        L.TargetSupport = Hit.GetComponent();
-        if (UPrimitiveComponent* S = L.TargetSupport.Get()) L.LocalTarget = S->GetComponentTransform().InverseTransformPosition(L.Target);
-        L.SwingLength = static_cast<float>(FVector::Dist(L.Start, L.Target));
-        if (L.SwingLength < 1.5f) { PlantLeg(Cand.Index, false); continue; }
-        L.bPlanted = false;
-        L.bSwinging = true;
-        L.Swing = 0.f;
-        L.SwingDuration = bWasPlanted ? SwingTime : SwingTime * .75f;
-        L.SwingHeight = StepHeight * FMath::Clamp(L.SwingLength / FMath::Max(StepDistance, 1.f), .45f, 1.35f);
-        ++Swinging;
+        if (BeginSwing(Cand.Index, Hit, SwingTime)) ++Swinging;
     }
 
     // 2. Advance swinging feet along a lifted arc; keep re-aiming during the first half of the swing.
@@ -977,27 +864,59 @@ void AArachnePawn::UpdateLegs(float Dt)
     {
         FArachneLeg& L = Legs[I];
         if (!L.bSwinging) continue;
-        L.Swing = FMath::Min(1.f, L.Swing + Dt / FMath::Max(L.SwingDuration, .05f));
-        const float T = L.Swing;
         FHitResult Hit;
-        if (T < .55f && (Speed > 10.0 || FMath::Abs(YawRate) > .2f) && FindFoot(L, PredictHome(L, L.SwingDuration * (1.f - T)), Hit))
+        if (L.Swing < .55f && (Speed > 10.0 || FMath::Abs(YawRate) > .2f) && FindFoot(L, PredictHome(L, L.SwingDuration * (1.f - L.Swing)), Hit))
         {
             L.Target = FMath::Lerp(L.Target, Hit.ImpactPoint, .35);
             L.TargetNormal = Hit.ImpactNormal;
             L.TargetSupport = Hit.GetComponent();
             if (UPrimitiveComponent* S = L.TargetSupport.Get()) L.LocalTarget = S->GetComponentTransform().InverseTransformPosition(L.Target);
         }
-        else if (UPrimitiveComponent* S = L.TargetSupport.Get())
-        {
-            L.Target = S->GetComponentTransform().TransformPosition(L.LocalTarget);
-        }
-        const float Ease = T * T * (3.f - 2.f * T);
-        const float Arc = FMath::Sin(PI * T) * (1.f + .3f * (1.f - T));   // lifts briskly, plants decisively
-        const FVector Lift = (L.StartNormal + L.TargetNormal + Up * 1.5).GetSafeNormal();
-        L.Foot = FMath::Lerp(L.Start, L.Target, static_cast<double>(Ease)) + Lift * (L.SwingHeight * Arc);
-        if (T >= 1.f) PlantLeg(I, true);
+        AdvanceSwing(I, Dt);
     }
 }
+
+void AArachnePawn::UpdateAnchoredLegs(float Dt)
+{
+    // Every leg walks to its anchor contact, most displaced first, keeping the wave gait so the grab looks deliberate.
+    TArray<FArachneLeg>& Legs = Rig.Legs;
+    const FTransform Base = BaseMeshTransform();
+    const float SwingTime = StepDuration * 1.25f;
+    IdleTime = 0.f;
+
+    int32 Swinging = 0;
+    for (const FArachneLeg& L : Legs) if (L.bSwinging) ++Swinging;
+
+    struct FCandidate { int32 Index; double Error; };
+    TArray<FCandidate, TInlineAllocator<8>> Candidates;
+    for (int32 I = 0; I < Legs.Num(); ++I)
+    {
+        FArachneLeg& L = Legs[I];
+        if (L.bSwinging) continue;
+        if (!AnchorFeet.IsValidIndex(I) || !AnchorFeet[I].bBlockingHit)
+        {
+            // Nothing to grab for this leg: tuck it towards the rest pose.
+            L.bPlanted = false;
+            L.Foot = FMath::Lerp(L.Foot, Base.TransformPosition(L.Rest.Last()) + SurfaceUp * 8.0, Damp(6.0, Dt));
+            continue;
+        }
+        const double Err = L.bPlanted ? FVector::Dist(L.Plant, AnchorFeet[I].ImpactPoint) : 1e6;
+        if (Err > AnchorFootTolerance) Candidates.Add({I, Err});
+    }
+    Candidates.Sort([](const FCandidate& A, const FCandidate& B) { return A.Error > B.Error; });
+
+    for (const FCandidate& Cand : Candidates)
+    {
+        if (Swinging >= MaxSwingingLegs) break;
+        if (Swinging > 0 && NeighbourSwinging(Legs, Cand.Index)) continue;
+        if (BeginSwing(Cand.Index, AnchorFeet[Cand.Index], SwingTime)) ++Swinging;
+    }
+    for (int32 I = 0; I < Legs.Num(); ++I) if (Legs[I].bSwinging) AdvanceSwing(I, Dt);
+}
+
+// =====================================================================================================================
+// Body visuals + pose
+// =====================================================================================================================
 
 void AArachnePawn::UpdateBodyVisual(float Dt)
 {
@@ -1007,11 +926,13 @@ void AArachnePawn::UpdateBodyVisual(float Dt)
         return;
     }
     const FTransform Base = BaseMeshTransform();
+    // Held poses define the body orientation themselves: stop fitting the body to the feet while anchored.
+    FootFitWeight = FMath::Lerp(FootFitWeight, bAnchored ? 0.f : 1.f, static_cast<float>(Damp(4.0, Dt)));
 
     // Fit a plane through the feet (relative to their rest heights): body pitches/rolls with the terrain.
     double Front = 0, Back = 0, Left = 0, Right = 0, Height = 0, Lift = 0;
     int32 NF = 0, NB = 0, NL = 0, NR = 0;
-    for (const FArachneLeg& L : Legs)
+    for (const FArachneLeg& L : Rig.Legs)
     {
         const double Z = Base.InverseTransformPosition(L.Foot).Z - L.Rest.Last().Z;
         Height += Z;
@@ -1019,14 +940,14 @@ void AArachnePawn::UpdateBodyVisual(float Dt)
         if (L.Side == 0) { Left += Z; ++NL; } else { Right += Z; ++NR; }
         if (L.bSwinging) Lift += FMath::Sin(PI * L.Swing);
     }
-    Height /= Legs.Num();
-    const double SlopeX = (Front / FMath::Max(NF, 1) - Back / FMath::Max(NB, 1)) / 170.0;   // + = front higher
-    const double SlopeY = (Right / FMath::Max(NR, 1) - Left / FMath::Max(NL, 1)) / 200.0;   // + = right higher
+    Height = Height / Rig.Legs.Num() * FootFitWeight;
+    const double SlopeX = (Front / FMath::Max(NF, 1) - Back / FMath::Max(NB, 1)) / 170.0 * FootFitWeight;   // + = front higher
+    const double SlopeY = (Right / FMath::Max(NR, 1) - Left / FMath::Max(NL, 1)) / 200.0 * FootFitWeight;   // + = right higher
 
     // Inertia: acceleration in the body frame (lags the body and tips it).
     const FVector Accel = GetActorTransform().InverseTransformVectorNoScale((TravelVelocity - PrevTravelVelocity) / FMath::Max(Dt, 1e-3f)).GetClampedToMaxSize(4000.0);
     const bool bGrounded = bAttached || Transition.bActive;
-    const double Breath = FMath::Sin(AnimTime * 2.1) * .8;
+    const double Breath = FMath::Sin(AnimTime * 2.1) * .8 * (1.0 - Stillness * .8);
 
     FVector OffsetTarget(
         FMath::Clamp(-Accel.X * .008 * LeanAmount, -14.0, 14.0),
@@ -1040,9 +961,10 @@ void AArachnePawn::UpdateBodyVisual(float Dt)
 
     // Abdomen: heavy, loosely coupled mass (deg): roll, pitch, yaw
     const double SpeedRatio = FMath::Clamp(Velocity.Size() / FMath::Max(MoveSpeed, 1.f), 0.0, 2.0);
+    const double Alive = 1.0 - Stillness * .85;
     const FVector AbdomenTarget(
         FMath::Clamp(Accel.Y * .004, -8.0, 8.0) * AbdomenJiggle,
-        (FMath::Clamp(Accel.X * .006, -12.0, 12.0) + FMath::Sin(GaitPhase * 2.0) * 1.6 * SpeedRatio + FMath::Sin(AnimTime * 1.6) * 1.2) * AbdomenJiggle,
+        (FMath::Clamp(Accel.X * .006, -12.0, 12.0) + FMath::Sin(GaitPhase * 2.0) * 1.6 * SpeedRatio + FMath::Sin(AnimTime * 1.6) * 1.2 * Alive) * AbdomenJiggle,
         FMath::Clamp(-YawRate * 9.0 - Accel.Y * .003, -16.0, 16.0) * AbdomenJiggle);
 
     const int32 Sub = FMath::Clamp(FMath::CeilToInt(Dt * 120.f), 1, 8);
@@ -1060,128 +982,45 @@ void AArachnePawn::UpdateBodyVisual(float Dt)
     SpiderMesh->SetRelativeLocationAndRotation(Tilt.RotateVector(FVector(0, 0, -BodyHeight)) + BodyOffsetSpring.X, Tilt);
 }
 
-void AArachnePawn::SolveLeg(const FArachneLeg& L, const FVector& FootWorld, TArray<FTransform>& Pose)
-{
-    const FTransform MeshT = SpiderMesh->GetComponentTransform();
-    const FVector Target = MeshT.InverseTransformPosition(FootWorld);
-    const FVector Z = FVector::UpVector;
-    TArray<FVector, TInlineAllocator<8>> P;
-    P.Append(L.Rest);
-
-    // 1. Yaw: the coxa takes a third, the trochanter the rest, so the leg's bend plane faces the foot.
-    const double TotalYaw = FMath::Clamp(SignedAngleAround(L.Rest[7] - L.Rest[1], Target - L.Rest[1], Z), -1.2, 1.2);
-    const FQuat CoxaYaw(Z, TotalYaw * .35);
-    for (int32 J = 1; J < 8; ++J) P[J] = L.Rest[0] + CoxaYaw.RotateVector(L.Rest[J] - L.Rest[0]);
-    const double TrochAngle = FMath::Clamp(SignedAngleAround(P[7] - P[1], Target - P[1], Z), -1.2, 1.2);
-    const FQuat TrochYaw(Z, TrochAngle);
-    for (int32 J = 2; J < 8; ++J) P[J] = P[1] + TrochYaw.RotateVector(P[J] - P[1]);
-    const FQuat LegYaw = TrochYaw * CoxaYaw;
-
-    // 2. Planar FABRIK femur -> claw. The bend plane contains the knee (patella), so knees always stay high.
-    const FVector Root = P[2];
-    FVector Goal = Target;
-    if (FVector::Dist(Root, Goal) > L.Reach * .999) Goal = Root + (Goal - Root).GetSafeNormal() * (L.Reach * .999);
-    const FVector PlaneN = FVector::CrossProduct(Goal - Root, P[4] - Root).GetSafeNormal();
-    const bool bPlane = !PlaneN.IsNearlyZero();
-    for (int32 Iter = 0; Iter < 16; ++Iter)
-    {
-        P[7] = Goal;
-        for (int32 J = 6; J >= 2; --J) P[J] = P[J + 1] + (P[J] - P[J + 1]).GetSafeNormal() * L.Lengths[J];
-        if (bPlane) for (int32 J = 3; J < 7; ++J) P[J] = FVector::PointPlaneProject(P[J], Root, PlaneN);
-        P[2] = Root;
-        for (int32 J = 2; J < 7; ++J) P[J + 1] = P[J] + (P[J + 1] - P[J]).GetSafeNormal() * L.Lengths[J];
-        if (FVector::DistSquared(P[7], Goal) < .04) break;
-    }
-    MaxFootError = FMath::Max(MaxFootError, static_cast<float>(FVector::Dist(P[7], Target)));
-
-    // 3. Bone rotations = rest rotation, then yaw, then the swing that lines the segment up with the solved chain.
-    for (int32 J = 0; J < 7; ++J)
-    {
-        const int32 Bone = L.Bones[J];
-        const FQuat Yaw = J == 0 ? CoxaYaw : LegYaw;
-        const FVector From = Yaw.RotateVector(L.Rest[J + 1] - L.Rest[J]).GetSafeNormal();
-        const FVector To = (P[J + 1] - P[J]).GetSafeNormal();
-        const FQuat Rot = (FQuat::FindBetweenNormals(From, To) * Yaw * ReferenceCS[Bone].GetRotation()).GetNormalized();
-        Pose[Bone] = FTransform(Rot, P[J], ReferenceCS[Bone].GetScale3D());
-    }
-    const int32 Tarsus = L.Bones[6], Claw = L.Bones[7];
-    const FQuat TarsusDelta = Pose[Tarsus].GetRotation() * ReferenceCS[Tarsus].GetRotation().Inverse();
-    Pose[Claw] = FTransform((TarsusDelta * ReferenceCS[Claw].GetRotation()).GetNormalized(), P[7], ReferenceCS[Claw].GetScale3D());
-
-    if (bShowDebug)
-    {
-        for (int32 J = 0; J < 7; ++J)
-            DrawDebugLine(GetWorld(), MeshT.TransformPosition(P[J]), MeshT.TransformPosition(P[J + 1]), FColor::Yellow, false, 0.f, 0, 1.5f);
-        DrawDebugSphere(GetWorld(), FootWorld, 4.f, 8, L.bPlanted ? FColor::Green : FColor::Orange, false, 0.f);
-        if (L.bSwinging) DrawDebugSphere(GetWorld(), L.Target, 3.f, 6, FColor::Blue, false, 0.f);
-    }
-}
-
-void AArachnePawn::AnimateExtras(float Dt, TArray<FTransform>& Pose)
-{
-    // Abdomen: spring driven sway about the pedicel.
-    if (AbdomenBone != INDEX_NONE)
-    {
-        const FVector A = AbdomenSpring.X;
-        const FQuat Q = FRotator(A.Y, A.Z, A.X).Quaternion();
-        const FTransform Delta = RotateAbout(ReferenceCS[AbdomenBone].GetLocation(), Q);
-        for (const int32 B : AbdomenSubtree) Pose[B] = Pose[B] * Delta;
-    }
-
-    // Pedipalps: they feel the ground ahead in counter-phase while walking and fidget while idle.
-    const double SpeedRatio = FMath::Clamp(Velocity.Size() / FMath::Max(MoveSpeed, 1.f), 0.0, 1.5);
-    static const double Share[4] = {.45, .8, .6, .35};
-    for (int32 S = 0; S < 2; ++S)
-    {
-        const double Side = S == 0 ? 1.0 : -1.0;
-        const double Walk = FMath::Sin(GaitPhase + S * PI) * 13.0 * SpeedRatio;
-        const double Idle = (FMath::Sin(AnimTime * 1.3 + S * 2.1) * 4.0 + FMath::Sin(AnimTime * 3.7 + S) * 1.8) * (1.0 - FMath::Min(SpeedRatio, 1.0));
-        const double Pitch = FMath::DegreesToRadians((Walk + Idle) * PedipalpMotion);
-        const double Yaw = FMath::DegreesToRadians(FMath::Sin(AnimTime * .9 + S * 1.3) * 5.0 * PedipalpMotion) * Side;
-        FTransform Acc = FTransform::Identity;
-        for (int32 K = 0; K < 4; ++K)
-        {
-            const int32 Bone = PalpBones[S][K];
-            if (Bone == INDEX_NONE) break;
-            const FVector Pivot = Acc.TransformPosition(PalpPivots[S][K]);
-            const FQuat Q = FQuat(Acc.GetRotation().RotateVector(FVector::YAxisVector), Pitch * Share[K])
-                          * FQuat(Acc.GetRotation().RotateVector(FVector::ZAxisVector), Yaw * Share[K]);
-            Acc = Acc * RotateAbout(Pivot, Q);
-            Pose[Bone] = ReferenceCS[Bone] * Acc;
-        }
-    }
-
-    // Chelicerae + fangs: slow idle flex.
-    for (int32 S = 0; S < 2; ++S)
-    {
-        if (ChelBones[S] == INDEX_NONE) continue;
-        const FQuat QC(FVector::YAxisVector, FMath::DegreesToRadians(FMath::Sin(AnimTime * .7 + S * .4) * 2.5));
-        const FTransform DC = RotateAbout(ReferenceCS[ChelBones[S]].GetLocation(), QC);
-        Pose[ChelBones[S]] = ReferenceCS[ChelBones[S]] * DC;
-        if (FangBones[S] != INDEX_NONE)
-        {
-            const FVector FangPivot = DC.TransformPosition(ReferenceCS[FangBones[S]].GetLocation());
-            const FQuat QF(DC.GetRotation().RotateVector(FVector::YAxisVector), FMath::DegreesToRadians((FMath::Sin(AnimTime * 1.1 + S) * .5 + .5) * 6.0));
-            Pose[FangBones[S]] = ReferenceCS[FangBones[S]] * DC * RotateAbout(FangPivot, QF);
-        }
-    }
-}
-
 void AArachnePawn::BuildPose(float Dt)
 {
     if (!IsRigValid() || !SpiderMesh->GetSkinnedAsset()) return;
-    TArray<FTransform> Pose = ReferenceCS;
+    TArray<FTransform> Pose = Rig.ReferenceCS;
     MaxFootError = 0.f;
-    for (const FArachneLeg& L : Legs) SolveLeg(L, L.Foot, Pose);
-    AnimateExtras(Dt, Pose);
+    const FTransform MeshT = SpiderMesh->GetComponentTransform();
+    const UWorld* DebugWorld = bDebugBody ? GetWorld() : nullptr;
+    for (const FArachneLeg& L : Rig.Legs) MaxFootError = FMath::Max(MaxFootError, Rig.SolveLeg(L, MeshT, L.Foot, Pose, DebugWorld));
 
-    const FReferenceSkeleton& Ref = SpiderMesh->GetSkinnedAsset()->GetRefSkeleton();
-    SpiderMesh->BoneSpaceTransforms.SetNum(Pose.Num());
-    for (int32 I = 0; I < Pose.Num(); ++I)
+    FArachneExtrasInput Extras;
+    Extras.AbdomenEuler = AbdomenSpring.X;
+    Extras.SpeedRatio = FMath::Clamp(Velocity.Size() / FMath::Max(MoveSpeed, 1.f), 0.0, 1.5);
+    Extras.GaitPhase = GaitPhase;
+    Extras.AnimTime = AnimTime;
+    Extras.PedipalpMotion = PedipalpMotion;
+    Extras.Stillness = Stillness;
+    Rig.AnimateExtras(Extras, Pose);
+    FArachneRig::ApplyPose(SpiderMesh, Pose);
+}
+
+void AArachnePawn::DrawBodyDebug() const
+{
+    UWorld* World = GetWorld();
+    const FVector P = GetActorLocation();
+    DrawDebugDirectionalArrow(World, P, P + SurfaceUp * 110.0, 15.f, bAttached ? FColor::Cyan : FColor::Red, false, 0.f, 0, 3.f);
+    DrawDebugDirectionalArrow(World, P, P + Velocity * .4, 12.f, FColor::Orange, false, 0.f, 0, 2.f);
+    if (Transition.bActive)
     {
-        const int32 Parent = Ref.GetParentIndex(I);
-        SpiderMesh->BoneSpaceTransforms[I] = Parent == INDEX_NONE ? Pose[I] : Pose[I].GetRelativeTransform(Pose[Parent]);
+        DrawDebugSphere(World, Transition.Pivot, 8.f, 8, Transition.bConvex ? FColor::Magenta : FColor::Yellow, false, 0.f);
+        DrawDebugLine(World, Transition.Pivot - Transition.Axis * 120.0, Transition.Pivot + Transition.Axis * 120.0, FColor::Magenta, false, 0.f, 0, 1.5f);
     }
-    SpiderMesh->MarkRefreshTransformDirty();
-    SpiderMesh->RefreshBoneTransforms();
+    for (const FArachneLeg& L : Rig.Legs)
+    {
+        DrawDebugSphere(World, L.Foot, 4.f, 8, L.bPlanted ? FColor::Green : FColor::Orange, false, 0.f);
+        if (L.bSwinging) DrawDebugSphere(World, L.Target, 3.f, 6, FColor::Blue, false, 0.f);
+    }
+    if (bAnchored)
+    {
+        DrawDebugCoordinateSystem(World, Anchor.Body.GetLocation(), Anchor.Body.Rotator(), 60.f, false, 0.f, 0, 1.5f);
+        for (const FHitResult& H : AnchorFeet) if (H.bBlockingHit) DrawDebugPoint(World, H.ImpactPoint, 9.f, FColor::Cyan, false, 0.f);
+    }
 }

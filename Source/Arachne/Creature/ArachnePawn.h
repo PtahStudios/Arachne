@@ -2,59 +2,35 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
+#include "Engine/HitResult.h"
+#include "Creature/ArachneRig.h"
 #include "ArachnePawn.generated.h"
 
 class USphereComponent;
 class UPoseableMeshComponent;
-class USpringArmComponent;
-class UCameraComponent;
 class USkeletalMesh;
-class UInputAction;
-class UInputMappingContext;
-struct FInputActionValue;
+class UArachneSensesComponent;
+class UArachneMemoryComponent;
+class UArachneNavigatorComponent;
+class UArachneBrainComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FArachneFootPlantedSignature, int32, LegIndex, FVector, Location, FVector, Normal, float, Strength);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FArachneLandedSignature, float, ImpactSpeed);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FArachneJumpedSignature);
 
-/** Damped harmonic spring (semi-implicit Euler). Frequency in Hz, Damping = damping ratio (1 = critical). */
-struct FArachneSpring
+/** A body pose the spider blends into and holds: a corner between walls and ceiling, a ceiling spot, the player's face. */
+USTRUCT(BlueprintType)
+struct FArachneAnchor
 {
-    FVector X = FVector::ZeroVector;
-    FVector V = FVector::ZeroVector;
-    void Step(const FVector& Target, double Frequency, double Damping, double Dt);
-    void Reset(const FVector& Value = FVector::ZeroVector) { X = Value; V = FVector::ZeroVector; }
-};
+    GENERATED_BODY()
 
-/** One procedural leg: 7 rigid segments (coxa..tarsus) + claw tip bone. */
-struct FArachneLeg
-{
-    TArray<int32> Bones;        // coxa, trochanter, femur, patella, tibia, metatarsus, tarsus, foot
-    TArray<FVector> Rest;       // component-space joint positions (8, last = claw tip)
-    TArray<double> Lengths;     // 7 segment lengths
-    double Reach = 0.0;         // femur joint -> claw tip, fully stretched
-    int32 Pair = 0;             // 1..4 from the front
-    int32 Side = 0;             // 0 = left, 1 = right
-
-    FVector Foot = FVector::ZeroVector;          // current world position of the claw (what IK solves to)
-    FVector Plant = FVector::ZeroVector;         // world contact while planted
-    FVector PlantNormal = FVector::UpVector;
-    FVector LocalPlant = FVector::ZeroVector;    // contact in support component space (moving platforms)
-    TWeakObjectPtr<UPrimitiveComponent> Support;
-
-    FVector Start = FVector::ZeroVector, StartNormal = FVector::UpVector;
-    FVector Target = FVector::ZeroVector, TargetNormal = FVector::UpVector;
-    FVector LocalTarget = FVector::ZeroVector;
-    TWeakObjectPtr<UPrimitiveComponent> TargetSupport;
-
-    FVector AirVelocity = FVector::ZeroVector;
-    float Swing = 1.f;
-    float SwingDuration = .2f;
-    float SwingHeight = 20.f;
-    float SwingLength = 0.f;
-    float PlantedTime = 0.f;
-    bool bPlanted = false;
-    bool bSwinging = false;
+    /** Body centre + orientation. Z axis = body up (points away from the surfaces it clings to), X = facing. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Anchor") FTransform Body = FTransform::Identity;
+    /** Seconds to glide from the current pose into the anchor. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Anchor", meta=(ClampMin="0.05")) float BlendTime = 1.f;
+    /** Feet grab a virtual plane instead of geometry (the camera lens when the player is caught). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Anchor") bool bVirtualSurface = false;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Anchor") FVector VirtualPoint = FVector::ZeroVector;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Anchor") FVector VirtualNormal = FVector::UpVector;
 };
 
 /** Rigid rotation of the body around an edge / inner corner line: exact circular arc, both position and orientation. */
@@ -72,12 +48,13 @@ struct FArachneTransition
 };
 
 /**
- * Surface crawler for the Arachne tarantula.
+ * ARACHNE - the tarantula body. AI driven (no input, no camera): the components below think, this class moves.
  *  - Adhesive locomotion on any collision surface (floor, walls, ceilings, slopes, moving platforms)
  *  - Arc transitions over convex edges and into concave corners, driven by speed so they never pop
- *  - Ballistic physics when detached: gravity, jump, landing impact, external impulses
- *  - Procedural wave/tetrapod gait with 8 grounded IK chains (coxa yaw + planar FABRIK)
- *  - Spring driven body sway, abdomen jiggle and pedipalp motion
+ *  - Anchors: glides into a held pose (corners, ceilings) with every foot on the nearest surface
+ *  - Procedural wave gait with 8 grounded IK chains (coxa yaw + planar FABRIK), spring driven secondary motion
+ * Steering comes from UArachneNavigatorComponent through SetMoveDirection / SetFacingDirection / SetSprint.
+ * It never jumps: when knocked off a surface it just falls and grabs whatever it hits.
  */
 UCLASS(Blueprintable)
 class ARACHNE_API AArachnePawn : public APawn
@@ -88,20 +65,22 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
     virtual void Tick(float DeltaSeconds) override;
-    virtual void SetupPlayerInputComponent(UInputComponent* Input) override;
-    virtual void NotifyControllerChanged() override;
     virtual FVector GetVelocity() const override { return TravelVelocity; }
 
     // ---------------------------------------------------------------- components
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne") TObjectPtr<USphereComponent> Collision;
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne") TObjectPtr<UPoseableMeshComponent> SpiderMesh;
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne") TObjectPtr<USpringArmComponent> CameraBoom;
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne") TObjectPtr<UCameraComponent> Camera;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne|AI") TObjectPtr<UArachneSensesComponent> Senses;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne|AI") TObjectPtr<UArachneMemoryComponent> Memory;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne|AI") TObjectPtr<UArachneNavigatorComponent> Navigator;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne|AI") TObjectPtr<UArachneBrainComponent> Brain;
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Arachne") TObjectPtr<USkeletalMesh> SpiderAsset;
 
     // ---------------------------------------------------------------- movement
+    /** Walking speed (cm/s). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement", meta=(ClampMin="1")) float MoveSpeed = 230.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float SprintMultiplier = 1.75f;
+    /** Speed multiplier while sprinting. The brain only sprints when it commits to an attack. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float SprintMultiplier = 2.4f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float Acceleration = 7.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float Deceleration = 9.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement", meta=(ClampMin="40")) float BodyHeight = 75.f;
@@ -116,13 +95,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float TransitionMinAngle = 38.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Movement") float EdgeWrapReach = 90.f;
 
-    // ---------------------------------------------------------------- physics
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float GravityScale = 1.4f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float JumpSpeed = 640.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float JumpForwardBoost = 180.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float AirControl = 1.2f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float AirGrabReach = 220.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Physics") float CoyoteTime = .12f;
+    // ---------------------------------------------------------------- falling (only when knocked off a surface)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Falling") float GravityScale = 1.4f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Falling") float AirGrabReach = 220.f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Falling") float CoyoteTime = .12f;
 
     // ---------------------------------------------------------------- legs / IK
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float StepDistance = 38.f;
@@ -132,6 +108,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float FootProbeReach = 110.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") int32 MaxSwingingLegs = 4;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float IdleSettleDistance = 7.f;
+    /** While anchored, a foot further than this from its anchor contact steps again. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Leg IK") float AnchorFootTolerance = 6.f;
 
     // ---------------------------------------------------------------- secondary motion
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Secondary") float BodySpringFrequency = 3.2f;
@@ -140,11 +118,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Secondary") float AbdomenJiggle = 1.f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Secondary") float PedipalpMotion = 1.f;
 
-    // ---------------------------------------------------------------- camera
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Camera") float CameraUpFollowSpeed = 4.f;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Camera") float MouseSensitivity = 1.f;
+    // ---------------------------------------------------------------- senses geometry
+    /** Eye position relative to the body centre: X = along facing, Z = along surface up. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Senses") FVector EyeOffset = FVector(55.f, 0.f, 18.f);
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Debug") bool bShowDebug = false;
+    // ---------------------------------------------------------------- debug
+    /** Draws leg chains, foot targets, surface normal and transition pivots. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Arachne|Debug") bool bDebugBody = false;
 
     // ---------------------------------------------------------------- state (read only)
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Arachne|State") FVector SurfaceUp = FVector::UpVector;
@@ -154,46 +134,46 @@ public:
 
     UPROPERTY(BlueprintAssignable, Category="Arachne|Events") FArachneFootPlantedSignature OnFootPlanted;
     UPROPERTY(BlueprintAssignable, Category="Arachne|Events") FArachneLandedSignature OnLanded;
-    UPROPERTY(BlueprintAssignable, Category="Arachne|Events") FArachneJumpedSignature OnJumped;
 
-    UFUNCTION(BlueprintCallable, Category="Arachne") void SetMovementInput(float Forward, float Right);
+    // ---------------------------------------------------------------- steering
+    /** World-space travel direction, length 0..1 = fraction of speed. Projected onto the current surface. */
+    UFUNCTION(BlueprintCallable, Category="Arachne|Steering") void SetMoveDirection(FVector WorldDirection);
+    /** Heading-relative input (X forward, Y right). The heading rolls with the surface, so "forward" climbs walls. */
+    UFUNCTION(BlueprintCallable, Category="Arachne|Steering") void SetMovementInput(float Forward, float Right);
+    /** Where the body faces. Zero = face the direction of travel. Anything else = crab walk / look around. */
+    UFUNCTION(BlueprintCallable, Category="Arachne|Steering") void SetFacingDirection(FVector WorldDirection);
+    UFUNCTION(BlueprintCallable, Category="Arachne|Steering") void SetSprint(bool bInSprint) { bSprint = bInSprint; }
+    /** 0 = lively idle, 1 = frozen (breathing, pedipalps and fangs almost stop). */
+    UFUNCTION(BlueprintCallable, Category="Arachne|Steering") void SetStillness(float InStillness) { Stillness = FMath::Clamp(InStillness, 0.f, 1.f); }
+    UFUNCTION(BlueprintPure, Category="Arachne|Steering") bool IsSprinting() const { return bSprint; }
+
+    // ---------------------------------------------------------------- anchors
+    UFUNCTION(BlueprintCallable, Category="Arachne|Anchor") void BeginAnchor(const FArachneAnchor& InAnchor);
+    UFUNCTION(BlueprintCallable, Category="Arachne|Anchor") void EndAnchor();
+    UFUNCTION(BlueprintPure, Category="Arachne|Anchor") bool IsAnchored() const { return bAnchored; }
+    /** True once the body reached the anchor and every foot that has a contact is planted on it. */
+    UFUNCTION(BlueprintPure, Category="Arachne|Anchor") bool IsAnchorSettled() const;
+
+    // ---------------------------------------------------------------- misc
     UFUNCTION(BlueprintCallable, Category="Arachne") void ResetCrawler(FVector Location, FRotator Rotation);
-    UFUNCTION(BlueprintCallable, Category="Arachne") void Jump();
     /** Physics kick. Strong kicks away from the surface detach the spider. */
     UFUNCTION(BlueprintCallable, Category="Arachne") void AddImpulse(FVector Impulse);
     UFUNCTION(BlueprintPure, Category="Arachne") bool IsTransitioning() const { return Transition.bActive; }
     UFUNCTION(BlueprintPure, Category="Arachne") FVector GetSurfaceVelocity() const { return Velocity; }
+    UFUNCTION(BlueprintPure, Category="Arachne") FVector GetFacing() const { return Facing; }
+    UFUNCTION(BlueprintPure, Category="Arachne") FVector GetEyeLocation() const;
 
-    bool IsRigValid() const { return Legs.Num() == 8; }
+    const FArachneRig& GetRig() const { return Rig; }
+    bool IsRigValid() const { return Rig.IsValid(); }
     bool IsWrappingEdge() const { return Transition.bActive; }
 
 private:
-    // input
-    void EnsureInputAssets();
-    void OnMove(const FInputActionValue& Value);
-    void OnMoveStop(const FInputActionValue& Value);
-    void OnLook(const FInputActionValue& Value);
-    void OnZoom(const FInputActionValue& Value);
-    void OnSprintOn(const FInputActionValue& Value);
-    void OnSprintOff(const FInputActionValue& Value);
-    void OnJump(const FInputActionValue& Value);
-    void OnDebug(const FInputActionValue& Value);
-    void OnReset(const FInputActionValue& Value);
-
-    UPROPERTY(Transient) TObjectPtr<UInputMappingContext> InputContext;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> MoveAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> LookAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> ZoomAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> SprintAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> JumpAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> DebugAction;
-    UPROPERTY(Transient) TObjectPtr<UInputAction> ResetAction;
-
     // locomotion
     void SimulateStep(float Dt);
     void StepAttached(float Dt);
     void StepTransition(float Dt);
     void StepAir(float Dt);
+    void StepAnchored(float Dt);
     void FollowSupport();
     void SetBodySupport(UPrimitiveComponent* Component);
     bool Probe(const FVector& Start, const FVector& End, FHitResult& Hit, float Radius = 0.f) const;
@@ -204,32 +184,44 @@ private:
     void Detach();
     void RotateFrame(const FQuat& Delta, bool bRotateVelocity);
     void ApplyFrame();
+    void TurnFacing(const FVector& Target, float Dt);
     FVector WishDirection() const;
     bool MoveBody(const FVector& Delta, FHitResult& Block);
 
-    // animation
-    void InitializeRig();
+    // legs + visuals
+    void LoadSpiderAsset();
     FTransform BaseMeshTransform() const;
     bool FindFoot(const FArachneLeg& Leg, const FVector& Home, FHitResult& Hit) const;
+    void ComputeAnchorFeet();
     void UpdateLegs(float Dt);
+    void UpdateGroundedLegs(float Dt);
+    void UpdateAnchoredLegs(float Dt);
+    void UpdateAirLegs(float Dt);
+    bool BeginSwing(int32 Index, const FHitResult& Hit, float SwingTime);
+    void AdvanceSwing(int32 Index, float Dt);
     void UpdateBodyVisual(float Dt);
-    void SolveLeg(const FArachneLeg& Leg, const FVector& FootWorld, TArray<FTransform>& Pose);
-    void AnimateExtras(float Dt, TArray<FTransform>& Pose);
     void BuildPose(float Dt);
     void PlantLeg(int32 Index, bool bBroadcast);
-    void UpdateCamera(float Dt);
+    void DrawBodyDebug() const;
 
+    FArachneRig Rig;
+
+    // steering
     FVector2D MoveInput = FVector2D::ZeroVector;
+    FVector WorldMove = FVector::ZeroVector;
+    FVector FacingOverride = FVector::ZeroVector;
+    bool bWorldMove = true;
+    bool bSprint = false;
+    float Stillness = 0.f;
+
+    // body state
     FVector Velocity = FVector::ZeroVector;
     FVector TravelVelocity = FVector::ZeroVector;
     FVector PrevTravelVelocity = FVector::ZeroVector;
     FVector Facing = FVector::ForwardVector;
-    FVector ViewHeading = FVector::ForwardVector;
+    FVector Heading = FVector::ForwardVector;   // rolls with the surface; reference for heading-relative input
     FVector SupportNormal = FVector::UpVector;
     FVector SupportPoint = FVector::ZeroVector;
-    FVector CameraUp = FVector::UpVector;
-    float CameraPitch = -24.f;
-    float DesiredArmLength = 520.f;
     float UnsupportedTime = 0.f;
     float AttachCooldown = 0.f;
     float LandingBoost = 0.f;
@@ -237,27 +229,24 @@ private:
     float AnimTime = 0.f;
     float YawRate = 0.f;
     float GaitPhase = 0.f;
-    bool bSprint = false;
     FArachneTransition Transition;
     TWeakObjectPtr<UPrimitiveComponent> BodySupport;
     FTransform LastSupportTransform = FTransform::Identity;
+
+    // anchor
+    FArachneAnchor Anchor;
+    bool bAnchored = false;
+    float AnchorAlpha = 0.f;
+    FVector AnchorStartLocation = FVector::ZeroVector;
+    FQuat AnchorStartRotation = FQuat::Identity;
+    TArray<FHitResult> AnchorFeet;      // one per leg; bBlockingHit = false when that leg has nothing to grab
+    float FootFitWeight = 1.f;          // how much the body tilts/lifts to fit the feet (0 while anchored)
 
     // visuals
     FArachneSpring BodyOffsetSpring;   // x = forward, y = right, z = up (cm)
     FArachneSpring BodyTiltSpring;     // x = roll, y = pitch (deg)
     FArachneSpring AbdomenSpring;      // x = roll, y = pitch, z = yaw (deg)
     FVector PrevFacing = FVector::ForwardVector;
-
-    // rig
-    TArray<FArachneLeg> Legs;
-    TArray<FTransform> ReferenceCS;
-    TArray<TArray<int32>> Children;
-    int32 AbdomenBone = INDEX_NONE;
-    TArray<int32> AbdomenSubtree;
-    int32 PalpBones[2][4];
-    FVector PalpPivots[2][4];
-    int32 ChelBones[2] = {INDEX_NONE, INDEX_NONE};
-    int32 FangBones[2] = {INDEX_NONE, INDEX_NONE};
     FVector SpawnLocation = FVector::ZeroVector;
     FRotator SpawnRotation = FRotator::ZeroRotator;
 };
